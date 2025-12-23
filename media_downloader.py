@@ -15,6 +15,8 @@ import pyrogram
 from loguru import logger
 from pyrogram.types import Audio, Document, Photo, Video, VideoNote, Voice
 from rich.logging import RichHandler
+from rich.console import Console
+from rich.theme import Theme
 
 from module.app import Application, ChatDownloadConfig, DownloadStatus, TaskNode
 from module.bot import start_download_bot, stop_download_bot
@@ -38,12 +40,54 @@ from utils.log import LogFilter
 from utils.meta import print_meta
 from utils.meta_data import MetaData
 
+# 创建自定义主题
+custom_theme = Theme({
+    "info": "cyan",
+    "warning": "yellow",
+    "error": "red",
+    "success": "green",
+    "debug": "dim blue",
+})
+console = Console(theme=custom_theme)
+
+# 配置RichHandler
+rich_handler = RichHandler(
+    console=console,
+    rich_tracebacks=True,
+    markup=True,
+    show_time=True,
+    show_path=False,
+    tracebacks_show_locals=False,
+    level=logging.DEBUG if os.environ.get("DEBUG") else logging.INFO
+)
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG if os.environ.get("DEBUG") else logging.INFO,
     format="%(message)s",
     datefmt="[%X]",
-    handlers=[RichHandler()],
+    handlers=[rich_handler],
 )
+
+# 设置不同级别的日志格式
+
+class ColorFormatter(logging.Formatter):
+    """自定义带颜色的日志格式化器"""
+    
+    COLORS = {
+        'DEBUG': '\033[36m',    # 青色
+        'INFO': '\033[32m',     # 绿色
+        'WARNING': '\033[33m',  # 黄色
+        'ERROR': '\033[31m',    # 红色
+        'CRITICAL': '\033[35m', # 紫色
+        'RESET': '\033[0m',     # 重置
+    }
+    
+    def format(self, record):
+        # 添加颜色
+        if record.levelname in self.COLORS:
+            record.levelname = f"{self.COLORS[record.levelname]}{record.levelname}{self.COLORS['RESET']}"
+            record.msg = f"{self.COLORS.get(record.levelname.strip(self.COLORS['RESET']), '')}{record.msg}{self.COLORS['RESET']}"
+        return super().format(record)
 
 CONFIG_NAME = "config.yaml"
 DATA_FILE_NAME = "data.yaml"
@@ -57,16 +101,6 @@ logging.getLogger("pyrogram.session.session").addFilter(LogFilter())
 logging.getLogger("pyrogram.client").addFilter(LogFilter())
 
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
-
-# ========== 修复：设置PLY环境变量 ==========
-# 在导入任何可能使用PLY的模块之前设置环境变量
-import tempfile
-import os
-
-# 创建一个临时目录用于PLY缓存
-ply_temp_dir = tempfile.mkdtemp(prefix='ply_')
-os.environ['PLY_TEMP_DIR'] = ply_temp_dir
-# ==========================================
 
 def setup_exit_signal_handlers():
     """设置优雅退出的信号处理器"""
@@ -128,9 +162,11 @@ async def record_failed_task(chat_id: Union[int, str], message_id: int, error_ms
         
         # 检查是否已存在
         existing = False
-        for task in failed_tasks[chat_key]:
+        existing_index = -1
+        for i, task in enumerate(failed_tasks[chat_key]):
             if task['message_id'] == message_id:
                 existing = True
+                existing_index = i
                 task['retry_count'] += 1
                 task['timestamp'] = datetime.now().isoformat()
                 task['error'] = error_msg[:200]
@@ -138,6 +174,9 @@ async def record_failed_task(chat_id: Union[int, str], message_id: int, error_ms
         
         if not existing:
             failed_tasks[chat_key].append(task_entry)
+            retry_count = 0
+        else:
+            retry_count = failed_tasks[chat_key][existing_index]['retry_count']
         
         # 限制每个chat的最大失败任务数
         if len(failed_tasks[chat_key]) > 100:
@@ -146,12 +185,13 @@ async def record_failed_task(chat_id: Union[int, str], message_id: int, error_ms
         # 保存到文件
         with open(failed_tasks_file, 'w', encoding='utf-8') as f:
             json.dump(failed_tasks, f, ensure_ascii=False, indent=2)
-            
-        logger.warning(f"已记录失败任务: chat_id={chat_id}, message_id={message_id}")
         
+        # ========== 新增：详细失败日志 ==========
+        logger.warning(f"任务失败记录: chat_id={chat_id}, message_id={message_id}, 错误: {error_msg[:100]}, 重试次数: {retry_count}")
+        # =======================================
+            
     except Exception as e:
         logger.error(f"记录失败任务时出错: {e}")
-
 async def load_failed_tasks(chat_id: Union[int, str]) -> list:
     """加载失败的任务"""
     try:
@@ -518,6 +558,11 @@ async def download_media(
     media_size = 0
     _media = None
     message = await fetch_message(client, message)
+    
+    # ========== 新增：开始下载日志 ==========
+    logger.info(f"开始下载消息 {message.id}...")
+    # =======================================
+    
     try:
         for _type in media_types:
             _media = getattr(message, _type, None)
@@ -531,6 +576,10 @@ async def download_media(
             ui_file_name = file_name
             if app.hide_file_name:
                 ui_file_name = f"****{os.path.splitext(file_name)[-1]}"
+            
+            # ========== 新增：文件信息日志 ==========
+            logger.debug(f"消息 {message.id}: 类型={_type}, 大小={media_size} bytes, 格式={file_format}")
+            # =======================================
 
             if _can_download(_type, file_formats, file_format):
                 if _is_exist(file_name):
@@ -543,6 +592,7 @@ async def download_media(
 
                         return DownloadStatus.SkipDownload, None
             else:
+                logger.info(f"消息 {message.id}: 文件格式 {file_format} 不在允许的下载列表中，跳过")
                 return DownloadStatus.SkipDownload, None
 
             break
@@ -554,12 +604,18 @@ async def download_media(
         )
         return DownloadStatus.FailedDownload, None
     if _media is None:
+        logger.debug(f"消息 {message.id}: 没有媒体内容，跳过")
         return DownloadStatus.SkipDownload, None
 
     message_id = message.id
 
     for retry in range(3):
         try:
+            # ========== 新增：重试日志 ==========
+            if retry > 0:
+                logger.warning(f"消息 {message.id}: 第 {retry} 次重试下载")
+            # ===================================
+            
             temp_download_path = await client.download_media(
                 message,
                 file_name=temp_file_name,
@@ -577,7 +633,11 @@ async def download_media(
                 _check_download_finish(media_size, temp_download_path, ui_file_name)
                 await asyncio.sleep(0.5)
                 _move_to_download_path(temp_download_path, file_name)
-                # TODO: if not exist file size or media
+                
+                # ========== 新增：下载成功日志 ==========
+                logger.success(f"消息 {message.id}: 下载成功 - {ui_file_name}")
+                # =======================================
+                
                 return DownloadStatus.SuccessDownload, file_name
         except OSError as e:
             logger.warning(f"网络连接错误: {e}，重试 {retry+1}/3")
@@ -622,6 +682,10 @@ async def download_media(
             )
             break
 
+    # ========== 新增：最终失败日志 ==========
+    logger.error(f"消息 {message.id}: 下载失败，已加入失败任务列表")
+    # =======================================
+    
     return DownloadStatus.FailedDownload, None
 
 def _load_config():
@@ -649,6 +713,9 @@ def _check_config() -> bool:
 
 async def worker(client: pyrogram.client.Client):
     """Work for download task"""
+    worker_id = id(asyncio.current_task())  # 为每个worker生成一个ID
+    logger.debug(f"Worker {worker_id} 启动")
+    
     while getattr(app, 'is_running', True) and not getattr(app, 'force_exit', False):
         try:
             # 使用带超时的get，避免阻塞
@@ -657,6 +724,7 @@ async def worker(client: pyrogram.client.Client):
             except asyncio.TimeoutError:
                 # 检查是否应该退出
                 if getattr(app, 'force_exit', False):
+                    logger.debug(f"Worker {worker_id} 收到退出信号")
                     break
                 continue
                 
@@ -668,20 +736,29 @@ async def worker(client: pyrogram.client.Client):
                 queue.task_done()
                 continue
 
+            # ========== 新增：任务开始处理日志 ==========
+            logger.debug(f"Worker {worker_id} 开始处理消息 {message.id} (聊天: {node.chat_id})")
+            # ===========================================
+
             try:
                 if node.client:
                     await download_task(node.client, message, node)
                 else:
                     await download_task(client, message, node)
+                    
+                # ========== 新增：任务完成日志 ==========
+                logger.debug(f"Worker {worker_id} 完成处理消息 {message.id}")
+                # =======================================
+                    
             except OSError as e:
-                logger.error(f"网络连接错误: {e}")
+                logger.error(f"Worker {worker_id}: 消息 {message.id} 网络连接错误: {e}")
                 # 网络错误，重新放回队列，稍后重试
                 await queue.put(item)
                 await asyncio.sleep(10)
                 queue.task_done()
                 continue
             except Exception as e:
-                logger.exception(f"下载任务异常: {e}")
+                logger.exception(f"Worker {worker_id}: 消息 {message.id} 下载任务异常: {e}")
                 await record_failed_task(node.chat_id, message.id, str(e))
                 node.download_status[message.id] = DownloadStatus.FailedDownload
                 queue.task_done()
@@ -689,12 +766,14 @@ async def worker(client: pyrogram.client.Client):
                 queue.task_done()
                 
         except asyncio.CancelledError:
-            logger.debug("Worker任务被取消")
+            logger.debug(f"Worker {worker_id} 任务被取消")
             break
         except Exception as e:
-            logger.exception(f"Worker异常: {e}")
+            logger.exception(f"Worker {worker_id} 异常: {e}")
             await asyncio.sleep(1)
-
+    
+    logger.debug(f"Worker {worker_id} 退出")
+    
 async def download_chat_task(
     client: pyrogram.Client,
     chat_download_config: ChatDownloadConfig,
@@ -712,10 +791,44 @@ async def download_chat_task(
 
     chat_download_config.node = node
 
+    # ========== 新增：重试失败任务日志 ==========
     # 首先重试之前的失败任务
     failed_tasks = await load_failed_tasks(node.chat_id)
     if failed_tasks:
-        logger.info(f"准备重试 {len(failed_tasks)} 个失败的任务...")
+        logger.info(f"发现 {len(failed_tasks)} 个失败任务等待重试")
+        
+        # 按重试次数分组统计
+        retry_counts = {}
+        for task in failed_tasks:
+            count = task.get('retry_count', 0)
+            retry_counts[count] = retry_counts.get(count, 0) + 1
+        
+        # 输出统计信息
+        logger.info("失败任务重试次数统计：")
+        for count, num in sorted(retry_counts.items()):
+            logger.info(f"  重试次数 {count}: {num} 个任务")
+        
+        # 如果失败任务不多，输出详细信息
+        if len(failed_tasks) <= 20:
+            logger.info("失败任务详情：")
+            for i, task in enumerate(failed_tasks, 1):
+                error_msg = task.get('error', '未知错误')
+                timestamp = task.get('timestamp', '未知时间')
+                retry_count = task.get('retry_count', 0)
+                logger.info(f"  {i}. 消息ID: {task['message_id']}, 错误: {error_msg[:50]}..., 重试次数: {retry_count}")
+        else:
+            # 只输出前10个和后10个
+            logger.info("部分失败任务详情（前10个和后10个）：")
+            for i, task in enumerate(failed_tasks[:10], 1):
+                logger.info(f"  {i}. 消息ID: {task['message_id']}, 重试次数: {task.get('retry_count', 0)}")
+            if len(failed_tasks) > 20:
+                logger.info(f"  ... 省略 {len(failed_tasks) - 20} 个任务 ...")
+            for i, task in enumerate(failed_tasks[-10:], len(failed_tasks) - 9):
+                logger.info(f"  {i}. 消息ID: {task['message_id']}, 重试次数: {task.get('retry_count', 0)}")
+        
+        logger.info("开始重试失败任务...")
+        # ==========================================
+        
         for task in failed_tasks:
             try:
                 # 只重试重试次数少于3次的任务
@@ -726,18 +839,30 @@ async def download_chat_task(
                     )
                     if message and not message.empty:
                         await add_download_task(message, node)
-                        logger.debug(f"已加入重试: message_id={task['message_id']}")
+                        logger.debug(f"已加入重试队列: message_id={task['message_id']}")
+                    else:
+                        logger.warning(f"消息 {task['message_id']} 获取失败或为空")
+                else:
+                    logger.warning(f"消息 {task['message_id']} 已达到最大重试次数（3次），跳过")
             except Exception as e:
-                logger.warning(f"重试失败任务时出错: {e}")
+                logger.warning(f"重试失败任务时出错（消息ID: {task['message_id']}）: {e}")
 
+    # 原有的ids_to_retry逻辑
     if chat_download_config.ids_to_retry:
         logger.info(f"{_t('Downloading files failed during last run')}...")
         skipped_messages: list = await client.get_messages(  # type: ignore
             chat_id=node.chat_id, message_ids=chat_download_config.ids_to_retry
         )
+        
+        logger.info(f"上次运行失败的 {len(chat_download_config.ids_to_retry)} 个任务：{chat_download_config.ids_to_retry}")
 
         for message in skipped_messages:
             await add_download_task(message, node)
+
+    # ========== 新增：开始下载时的统计 ==========
+    total_added = node.total_task
+    logger.info(f"开始下载任务，当前队列中有 {total_added} 个任务")
+    # ==========================================
 
     async for message in messages_iter:  # type: ignore
         meta_data = MetaData()
@@ -769,11 +894,19 @@ async def download_chat_task(
                     message,
                     DownloadStatus.SkipDownload,
                 )
+        
+        # ========== 新增：进度日志 ==========
+        if node.total_task % 100 == 0:  # 每100个任务输出一次进度
+            logger.info(f"已添加 {node.total_task} 个下载任务到队列...")
+        # ===================================
 
     chat_download_config.need_check = True
     chat_download_config.total_task = node.total_task
     node.is_running = True
-
+    
+    # ========== 新增：任务统计 ==========
+    logger.info(f"任务添加完成，共 {node.total_task} 个任务等待下载")
+    # ===================================
 async def download_all_chat(client: pyrogram.Client):
     """Download All chat"""
     for key, value in app.chat_download_config.items():
@@ -816,9 +949,14 @@ async def stop_server(client: pyrogram.Client):
 
 def main():
     """Main function of the downloader."""
-    
-    # 设置信号处理器
+    # 1. 设置信号处理器
     setup_exit_signal_handlers()
+    
+    # ========== 新增：启动日志 ==========
+    logger.info("=" * 60)
+    logger.info("Telegram Media Downloader 启动")
+    logger.info("=" * 60)
+    # ===================================
     
     # 添加全局异常处理
     def global_exception_handler(loop, context):
@@ -859,6 +997,18 @@ def main():
         app.loop.run_until_complete(start_server(client))
         logger.success(_t("Successfully started (Press Ctrl+C to stop)"))
         
+        # ========== 新增：运行状态日志 ==========
+        logger.info(f"配置信息:")
+        logger.info(f"  - 最大并发传输数: {app.max_concurrent_transmissions}")
+        logger.info(f"  - 最大下载任务数: {app.max_download_task}")
+        logger.info(f"  - 媒体类型: {app.media_types}")
+        logger.info(f"  - 聊天配置数: {len(app.chat_download_config)}")
+        
+        # 输出每个聊天的配置
+        for chat_id, config in app.chat_download_config.items():
+            logger.info(f"  聊天 {chat_id}: 最后读取消息ID: {config.last_read_message_id}")
+        # ======================================
+        
         # 设置force_exit标志
         if not hasattr(app, 'force_exit'):
             app.force_exit = False
@@ -866,14 +1016,21 @@ def main():
             app.is_running = True
         
         app.loop.create_task(download_all_chat(client))
-        for _ in range(app.max_download_task):
+        for i in range(app.max_download_task):
             task = app.loop.create_task(worker(client))
             tasks.append(task)
+            logger.debug(f"启动 Worker {i+1}/{app.max_download_task}")
         
         if app.bot_token:
             app.loop.run_until_complete(
                 start_download_bot(app, client, add_download_task, download_chat_task)
             )
+        
+        # ========== 新增：运行中状态日志 ==========
+        logger.info("=" * 60)
+        logger.info("所有组件已启动，开始处理任务...")
+        logger.info("=" * 60)
+        # ========================================
         
         # 修改运行循环，检查强制退出标志
         while getattr(app, 'is_running', True) and not getattr(app, 'force_exit', False):
@@ -895,12 +1052,20 @@ def main():
         if hasattr(app, 'is_running'):
             app.is_running = False
         
+        # ========== 新增：退出统计日志 ==========
+        logger.info("=" * 60)
+        logger.info("程序正在停止...")
+        logger.info(f"当前队列剩余任务: {queue.qsize()}")
+        logger.info("=" * 60)
+        # ======================================
+        
         # 快速退出，不再等待队列
         logger.info("正在停止所有任务...")
         
         # 取消所有worker任务
-        for task in tasks:
+        for i, task in enumerate(tasks):
             task.cancel()
+            logger.debug(f"取消 Worker {i+1}")
         
         # 立即保存配置
         logger.info(f"{_t('update config')}......")
@@ -925,11 +1090,16 @@ def main():
         logger.info(_t("Stopped!"))
         # check_for_updates(app.proxy)
         
+        # ========== 新增：最终统计日志 ==========
+        logger.info("=" * 60)
+        logger.info("下载统计:")
         logger.success(
             f"{_t('total download')} {app.total_download_task}, "
             f"{_t('total upload file')} "
             f"{app.cloud_drive_config.total_upload_success_file_count}"
         )
+        logger.info("=" * 60)
+        # ======================================
         
         # 保存失败任务统计
         try:
@@ -939,9 +1109,12 @@ def main():
                     failed_tasks = json.load(f)
                 total_failed = sum(len(tasks) for tasks in failed_tasks.values())
                 logger.info(f"当前失败任务数: {total_failed}")
+                
+                # 输出每个聊天的失败任务数
+                for chat_id, tasks_list in failed_tasks.items():
+                    logger.info(f"  聊天 {chat_id}: {len(tasks_list)} 个失败任务")
         except:
             pass
-
 if __name__ == "__main__":
     if _check_config():
         main()
