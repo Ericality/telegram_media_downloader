@@ -1,9 +1,13 @@
 """Downloads media from telegram."""
 import asyncio
+import json
 import logging
 import os
 import shutil
+import signal
+import sys
 import time
+from datetime import datetime
 from typing import List, Optional, Tuple, Union
 
 import pyrogram
@@ -53,6 +57,139 @@ logging.getLogger("pyrogram.client").addFilter(LogFilter())
 
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
+# 全局异常处理器
+def setup_exit_signal_handlers():
+    """设置优雅退出的信号处理器"""
+    def signal_handler(signum, frame):
+        logger.info(f"接收到信号 {signum}，正在优雅退出...")
+        if hasattr(app, 'is_running'):
+            app.is_running = False
+        
+        # 设置强制退出标志
+        if hasattr(app, 'force_exit'):
+            app.force_exit = True
+        
+        # 如果是SIGINT（Ctrl+C），等待一段时间后强制退出
+        if signum == signal.SIGINT:
+            logger.info("等待活动任务完成，再次按Ctrl+C强制退出...")
+            # 设置定时器，如果10秒后还没退出则强制退出
+            def force_exit():
+                logger.warning("等待超时，强制退出...")
+                try:
+                    app.update_config()
+                except:
+                    pass
+                sys.exit(1)
+            
+            # 在子线程中设置定时器
+            import threading
+            timer = threading.Timer(10.0, force_exit)
+            timer.daemon = True
+            timer.start()
+            
+            # 改变信号处理，第二次按Ctrl+C直接退出
+            signal.signal(signal.SIGINT, lambda s, f: sys.exit(1))
+            
+        # 如果是SIGTERM（docker停止命令），需要立即停止
+        elif signum == signal.SIGTERM:
+            logger.info("收到终止信号，立即停止...")
+            try:
+                app.update_config()
+            except:
+                pass
+            sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    logger.debug("信号处理器已设置")
+
+async def record_failed_task(chat_id: Union[int, str], message_id: int, error_msg: str):
+    """记录失败的任务以便重试"""
+    try:
+        failed_tasks_file = os.path.join(app.session_file_path, "failed_tasks.json")
+        
+        # 读取现有的失败任务
+        failed_tasks = {}
+        if os.path.exists(failed_tasks_file):
+            try:
+                with open(failed_tasks_file, 'r', encoding='utf-8') as f:
+                    failed_tasks = json.load(f)
+            except:
+                failed_tasks = {}
+        
+        # 获取chat_id对应的失败任务列表
+        chat_key = str(chat_id)
+        if chat_key not in failed_tasks:
+            failed_tasks[chat_key] = []
+        
+        # 避免重复添加
+        task_entry = {
+            'message_id': message_id,
+            'error': error_msg[:200],  # 截断错误信息
+            'timestamp': datetime.now().isoformat(),
+            'retry_count': 0
+        }
+        
+        # 检查是否已存在
+        existing = False
+        for task in failed_tasks[chat_key]:
+            if task['message_id'] == message_id:
+                existing = True
+                task['retry_count'] += 1
+                task['timestamp'] = datetime.now().isoformat()
+                task['error'] = error_msg[:200]
+                break
+        
+        if not existing:
+            failed_tasks[chat_key].append(task_entry)
+        
+        # 限制每个chat的最大失败任务数
+        if len(failed_tasks[chat_key]) > 100:
+            failed_tasks[chat_key] = failed_tasks[chat_key][-100:]
+        
+        # 保存到文件
+        with open(failed_tasks_file, 'w', encoding='utf-8') as f:
+            json.dump(failed_tasks, f, ensure_ascii=False, indent=2)
+            
+        logger.warning(f"已记录失败任务: chat_id={chat_id}, message_id={message_id}")
+        
+    except Exception as e:
+        logger.error(f"记录失败任务时出错: {e}")
+
+async def load_failed_tasks(chat_id: Union[int, str]) -> list:
+    """加载失败的任务"""
+    try:
+        failed_tasks_file = os.path.join(app.session_file_path, "failed_tasks.json")
+        if not os.path.exists(failed_tasks_file):
+            return []
+        
+        with open(failed_tasks_file, 'r', encoding='utf-8') as f:
+            all_failed_tasks = json.load(f)
+        
+        chat_key = str(chat_id)
+        if chat_key in all_failed_tasks:
+            # 过滤掉过时的失败任务（超过24小时）
+            now = datetime.now()
+            recent_tasks = []
+            for task in all_failed_tasks[chat_key]:
+                try:
+                    task_time = datetime.fromisoformat(task['timestamp'])
+                    if (now - task_time).total_seconds() < 24 * 3600:  # 24小时内
+                        recent_tasks.append(task)
+                except:
+                    recent_tasks.append(task)  # 如果时间解析失败，保留任务
+            
+            # 更新文件（移除过时任务）
+            all_failed_tasks[chat_key] = recent_tasks
+            with open(failed_tasks_file, 'w', encoding='utf-8') as f:
+                json.dump(all_failed_tasks, f, ensure_ascii=False, indent=2)
+            
+            return recent_tasks
+        
+        return []
+    except Exception as e:
+        logger.error(f"加载失败任务时出错: {e}")
+        return []
 
 def _check_download_finish(media_size: int, download_path: str, ui_file_name: str):
     """Check download task if finish
@@ -79,7 +216,6 @@ def _check_download_finish(media_size: int, download_path: str, ui_file_name: st
         os.remove(download_path)
         raise pyrogram.errors.exceptions.bad_request_400.BadRequest()
 
-
 def _move_to_download_path(temp_download_path: str, download_path: str):
     """Move file to download path
 
@@ -97,7 +233,6 @@ def _move_to_download_path(temp_download_path: str, download_path: str):
     os.makedirs(directory, exist_ok=True)
     shutil.move(temp_download_path, download_path)
 
-
 def _check_timeout(retry: int, _: int):
     """Check if message download timeout, then add message id into failed_ids
 
@@ -113,7 +248,6 @@ def _check_timeout(retry: int, _: int):
     if retry == 2:
         return True
     return False
-
 
 def _can_download(_type: str, file_formats: dict, file_format: Optional[str]) -> bool:
     """
@@ -141,7 +275,6 @@ def _can_download(_type: str, file_formats: dict, file_format: Optional[str]) ->
             return False
     return True
 
-
 def _is_exist(file_path: str) -> bool:
     """
     Check if a file exists and it is not a directory.
@@ -158,9 +291,7 @@ def _is_exist(file_path: str) -> bool:
     """
     return not os.path.isdir(file_path) and os.path.exists(file_path)
 
-
 # pylint: disable = R0912
-
 
 async def _get_media_meta(
     chat_id: Union[int, str],
@@ -254,7 +385,6 @@ async def _get_media_meta(
         file_name = os.path.join(file_save_path, gen_file_name)
     return truncate_filename(file_name), truncate_filename(temp_file_name), file_format
 
-
 async def add_download_task(
     message: pyrogram.types.Message,
     node: TaskNode,
@@ -266,7 +396,6 @@ async def add_download_task(
     await queue.put((message, node))
     node.total_task += 1
     return True
-
 
 async def save_msg_to_file(
     app, chat_id: Union[int, str], message: pyrogram.types.Message
@@ -293,7 +422,6 @@ async def save_msg_to_file(
         f.write(message.text or "")
 
     return DownloadStatus.SuccessDownload, file_name
-
 
 async def download_task(
     client: pyrogram.Client, message: pyrogram.types.Message, node: TaskNode
@@ -344,9 +472,7 @@ async def download_task(
         file_size,
     )
 
-
 # pylint: disable = R0915,R0914
-
 
 @record_download_status
 async def download_media(
@@ -457,6 +583,13 @@ async def download_media(
                 _move_to_download_path(temp_download_path, file_name)
                 # TODO: if not exist file size or media
                 return DownloadStatus.SuccessDownload, file_name
+        except OSError as e:
+            logger.warning(f"网络连接错误: {e}，重试 {retry+1}/3")
+            await asyncio.sleep(RETRY_TIME_OUT * (retry + 1))  # 递增等待时间
+            if retry == 2:
+                # 最后一次重试失败，记录到失败任务
+                await record_failed_task(node.chat_id, message.id, f"Network error: {str(e)}")
+                raise  # 重新抛出，让worker处理
         except pyrogram.errors.exceptions.bad_request_400.BadRequest:
             logger.warning(
                 f"Message[{message.id}]: {_t('file reference expired, refetching')}..."
@@ -495,11 +628,9 @@ async def download_media(
 
     return DownloadStatus.FailedDownload, None
 
-
 def _load_config():
     """Load config"""
     app.load_config()
-
 
 def _check_config() -> bool:
     """Check config"""
@@ -518,25 +649,44 @@ def _check_config() -> bool:
 
     return True
 
-
 async def worker(client: pyrogram.client.Client):
     """Work for download task"""
-    while app.is_running:
+    while getattr(app, 'is_running', True):
         try:
             item = await queue.get()
             message = item[0]
             node: TaskNode = item[1]
 
-            if node.is_stop_transmission:
+            if node.is_stop_transmission or getattr(app, 'force_exit', False):
+                # 重新放入队列以便其他worker处理
+                await queue.put(item)
+                await asyncio.sleep(0.1)
                 continue
 
-            if node.client:
-                await download_task(node.client, message, node)
-            else:
-                await download_task(client, message, node)
+            try:
+                if node.client:
+                    await download_task(node.client, message, node)
+                else:
+                    await download_task(client, message, node)
+            except OSError as e:
+                logger.error(f"网络连接错误: {e}")
+                # 网络错误，重新放回队列，稍后重试
+                await queue.put(item)
+                await asyncio.sleep(10)  # 等待网络恢复
+                continue
+            except Exception as e:
+                logger.exception(f"下载任务异常: {e}")
+                # 记录失败的任务以便重试
+                await record_failed_task(node.chat_id, message.id, str(e))
+                node.download_status[message.id] = DownloadStatus.FailedDownload
+        except asyncio.CancelledError:
+            logger.debug("Worker任务被取消")
+            break
         except Exception as e:
-            logger.exception(f"{e}")
-
+            logger.exception(f"Worker异常: {e}")
+            await asyncio.sleep(1)
+        finally:
+            queue.task_done()
 
 async def download_chat_task(
     client: pyrogram.Client,
@@ -554,6 +704,24 @@ async def download_chat_task(
     )
 
     chat_download_config.node = node
+
+    # 首先重试之前的失败任务
+    failed_tasks = await load_failed_tasks(node.chat_id)
+    if failed_tasks:
+        logger.info(f"准备重试 {len(failed_tasks)} 个失败的任务...")
+        for task in failed_tasks:
+            try:
+                # 只重试重试次数少于3次的任务
+                if task.get('retry_count', 0) < 3:
+                    message = await client.get_messages(
+                        chat_id=node.chat_id, 
+                        message_ids=task['message_id']
+                    )
+                    if message and not message.empty:
+                        await add_download_task(message, node)
+                        logger.debug(f"已加入重试: message_id={task['message_id']}")
+            except Exception as e:
+                logger.warning(f"重试失败任务时出错: {e}")
 
     if chat_download_config.ids_to_retry:
         logger.info(f"{_t('Downloading files failed during last run')}...")
@@ -599,7 +767,6 @@ async def download_chat_task(
     chat_download_config.total_task = node.total_task
     node.is_running = True
 
-
 async def download_all_chat(client: pyrogram.Client):
     """Download All chat"""
     for key, value in app.chat_download_config.items():
@@ -611,7 +778,6 @@ async def download_all_chat(client: pyrogram.Client):
         finally:
             value.need_check = True
 
-
 async def run_until_all_task_finish():
     """Normal download"""
     while True:
@@ -620,17 +786,14 @@ async def run_until_all_task_finish():
             if not value.need_check or value.total_task != value.finish_task:
                 finish = False
 
-        if (not app.bot_token and finish) or app.restart_program:
+        if (not app.bot_token and finish) or getattr(app, 'restart_program', False) or getattr(app, 'force_exit', False):
             break
 
         await asyncio.sleep(1)
 
-
 def _exec_loop():
     """Exec loop"""
-
     app.loop.run_until_complete(run_until_all_task_finish())
-
 
 async def start_server(client: pyrogram.Client):
     """
@@ -638,16 +801,34 @@ async def start_server(client: pyrogram.Client):
     """
     await client.start()
 
-
 async def stop_server(client: pyrogram.Client):
     """
     Stop the server using the provided client.
     """
     await client.stop()
 
-
 def main():
     """Main function of the downloader."""
+    # 设置信号处理器
+    setup_exit_signal_handlers()
+    
+    # 添加全局异常处理
+    def global_exception_handler(loop, context):
+        """全局异常处理器"""
+        exception = context.get('exception')
+        if isinstance(exception, OSError) and 'Connection lost' in str(exception):
+            logger.error("检测到连接丢失，尝试恢复...")
+        elif exception:
+            logger.error(f"未处理的异常: {exception}")
+        
+        # 记录异常信息
+        logger.error(f"异常上下文: {context}")
+        
+        # 如果设置了强制退出，则退出程序
+        if hasattr(app, 'force_exit') and app.force_exit:
+            logger.info("强制退出程序中...")
+            sys.exit(1)
+    
     tasks = []
     client = HookClient(
         "media_downloader",
@@ -657,47 +838,119 @@ def main():
         workdir=app.session_file_path,
         start_timeout=app.start_timeout,
     )
+    
     try:
         app.pre_run()
         init_web(app)
-
+        
+        # 设置全局异常处理器
+        app.loop.set_exception_handler(global_exception_handler)
+        
         set_max_concurrent_transmissions(client, app.max_concurrent_transmissions)
-
+        
         app.loop.run_until_complete(start_server(client))
         logger.success(_t("Successfully started (Press Ctrl+C to stop)"))
-
+        
+        # 设置force_exit标志
+        if not hasattr(app, 'force_exit'):
+            app.force_exit = False
+        if not hasattr(app, 'is_running'):
+            app.is_running = True
+        
         app.loop.create_task(download_all_chat(client))
         for _ in range(app.max_download_task):
             task = app.loop.create_task(worker(client))
             tasks.append(task)
-
+        
         if app.bot_token:
             app.loop.run_until_complete(
                 start_download_bot(app, client, add_download_task, download_chat_task)
             )
-        _exec_loop()
+        
+        # 修改运行循环，检查强制退出标志
+        while getattr(app, 'is_running', True) and not getattr(app, 'force_exit', False):
+            try:
+                _exec_loop()
+            except KeyboardInterrupt:
+                logger.info(_t("KeyboardInterrupt"))
+                if hasattr(app, 'force_exit'):
+                    app.force_exit = True
+                break
+        
     except KeyboardInterrupt:
         logger.info(_t("KeyboardInterrupt"))
+        if hasattr(app, 'force_exit'):
+            app.force_exit = True
     except Exception as e:
         logger.exception("{}", e)
     finally:
-        app.is_running = False
+        if hasattr(app, 'is_running'):
+            app.is_running = False
+        
+        # 等待所有任务完成或超时
+        logger.info("等待活动任务完成...")
+        timeout = 30  # 最大等待30秒
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            try:
+                if queue.empty():
+                    break
+                logger.info(f"等待队列清空... ({queue.qsize()} 个任务)")
+                time.sleep(1)
+            except:
+                break
+        
+        # 保存配置
+        logger.info(f"{_t('update config')}......")
+        try:
+            app.update_config()
+            logger.success(f"{_t('Updated last read message_id to config file')}")
+        except Exception as e:
+            logger.error(f"保存配置时出错: {e}")
+        
         if app.bot_token:
-            app.loop.run_until_complete(stop_download_bot())
-        app.loop.run_until_complete(stop_server(client))
+            try:
+                app.loop.run_until_complete(stop_download_bot())
+            except:
+                pass
+        
+        # 停止客户端
+        try:
+            app.loop.run_until_complete(stop_server(client))
+        except:
+            pass
+        
+        # 取消所有任务
         for task in tasks:
             task.cancel()
+        
+        # 等待任务取消完成
+        if tasks:
+            try:
+                app.loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+            except:
+                pass
+        
         logger.info(_t("Stopped!"))
         # check_for_updates(app.proxy)
-        logger.info(f"{_t('update config')}......")
-        app.update_config()
+        
         logger.success(
-            f"{_t('Updated last read message_id to config file')},"
             f"{_t('total download')} {app.total_download_task}, "
             f"{_t('total upload file')} "
             f"{app.cloud_drive_config.total_upload_success_file_count}"
         )
-
+        
+        # 保存失败任务统计
+        try:
+            failed_tasks_file = os.path.join(app.session_file_path, "failed_tasks.json")
+            if os.path.exists(failed_tasks_file):
+                with open(failed_tasks_file, 'r', encoding='utf-8') as f:
+                    failed_tasks = json.load(f)
+                total_failed = sum(len(tasks) for tasks in failed_tasks.values())
+                logger.info(f"当前失败任务数: {total_failed}")
+        except:
+            pass
 
 if __name__ == "__main__":
     if _check_config():
