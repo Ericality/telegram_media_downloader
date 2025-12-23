@@ -99,29 +99,6 @@ def setup_exit_signal_handlers():
     signal.signal(signal.SIGTERM, signal_handler)
     logger.debug("信号处理器已设置")
 
-# ========== 修复：修复module目录权限 ==========
-def fix_module_permissions():
-    """修复module目录权限，让PLY可以写入缓存文件"""
-    module_dir = '/app/module'
-    if os.path.exists(module_dir):
-        try:
-            # 修改目录权限为755（rwxr-xr-x）
-            os.chmod(module_dir, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
-            
-            # 确保特定的PLY缓存文件可写
-            ply_files = ['parser.out', 'parsetab.py', 'parsetab.pyc']
-            for file in ply_files:
-                file_path = os.path.join(module_dir, file)
-                if os.path.exists(file_path):
-                    try:
-                        os.chmod(file_path, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
-                    except:
-                        pass
-                        
-        except Exception as e:
-            logger.warning(f"修复module目录权限时出错: {e}")
-# =============================================
-
 async def record_failed_task(chat_id: Union[int, str], message_id: int, error_msg: str):
     """记录失败的任务以便重试"""
     try:
@@ -839,10 +816,8 @@ async def stop_server(client: pyrogram.Client):
 
 def main():
     """Main function of the downloader."""
-    # 1. 修复权限问题
-    fix_module_permissions()
     
-    # 2. 设置信号处理器
+    # 设置信号处理器
     setup_exit_signal_handlers()
     
     # 添加全局异常处理
