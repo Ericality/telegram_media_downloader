@@ -8,8 +8,8 @@ import signal
 import stat
 import sys
 import time
-from datetime import datetime
-from typing import List, Optional, Tuple, Union
+from datetime import datetime, timedelta
+from typing import List, Optional, Tuple, Union, Dict, Any
 
 import pyrogram
 from loguru import logger
@@ -101,6 +101,220 @@ logging.getLogger("pyrogram.session.session").addFilter(LogFilter())
 logging.getLogger("pyrogram.client").addFilter(LogFilter())
 
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
+
+# 磁盘空间监控状态
+class DiskSpaceMonitor:
+    def __init__(self):
+        self.space_low = False
+        self.last_check_time = 0
+        self.last_notification_time = 0
+        self.paused_workers = set()
+        self.stats_start_time = datetime.now()
+        self.stats_since_last_notification = {
+            "tasks_completed": 0,
+            "tasks_failed": 0,
+            "tasks_skipped": 0,
+            "download_size": 0
+        }
+
+disk_monitor = DiskSpaceMonitor()
+
+async def check_disk_space(threshold_gb: float = 10.0) -> tuple:
+    """
+    检查磁盘可用空间
+    Returns: (has_enough_space, available_gb, total_gb)
+    """
+    try:
+        # 获取下载目录所在的磁盘信息
+        download_path = app.download_path if hasattr(app, 'download_path') else "/app/downloads"
+        
+        # 如果路径不存在，使用根目录
+        if not os.path.exists(download_path):
+            download_path = "/"
+            
+        disk_usage = psutil.disk_usage(download_path)
+        
+        available_gb = disk_usage.free / (1024**3)  # 转换为GB
+        total_gb = disk_usage.total / (1024**3)
+        threshold_gb = float(threshold_gb)
+        
+        has_enough_space = available_gb >= threshold_gb
+        
+        return has_enough_space, round(available_gb, 2), round(total_gb, 2)
+        
+    except Exception as e:
+        logger.error(f"检查磁盘空间失败: {e}")
+        return True, 0, 0  # 如果检查失败，假设有足够空间
+
+async def send_bark_notification(title: str, body: str, url: str = None):
+    """发送Bark通知"""
+    try:
+        # 从配置获取URL
+        if not url:
+            bark_config = getattr(app, 'bark_notification', {})
+            if not bark_config.get('enabled', False):
+                return False
+            url = bark_config.get('url', '')
+            
+        if not url:
+            return False
+            
+        # 确保URL格式正确
+        if not url.startswith('http'):
+            url = f"https://{url}"
+            
+        # 构建请求数据
+        payload = {
+            "title": title,
+            "body": body,
+            "sound": "alarm",  # 可选：通知音效
+            "icon": "https://telegram.org/img/t_logo.png"  # 可选：图标
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=10) as response:
+                if response.status == 200:
+                    logger.info(f"Bark通知已发送: {title}")
+                    return True
+                else:
+                    logger.warning(f"Bark通知发送失败: {response.status}")
+                    return False
+                    
+    except Exception as e:
+        logger.error(f"发送Bark通知时出错: {e}")
+        return False
+
+async def disk_space_monitor_task():
+    """磁盘空间监控任务"""
+    while getattr(app, 'is_running', True):
+        try:
+            # 从配置获取阈值
+            bark_config = getattr(app, 'bark_notification', {})
+            threshold_gb = bark_config.get('disk_space_threshold_gb', 10.0)
+            check_interval = bark_config.get('space_check_interval', 300)
+            
+            # 检查磁盘空间
+            has_space, available_gb, total_gb = await check_disk_space(threshold_gb)
+            
+            current_time = time.time()
+            notification_cooldown = 3600  # 1小时内不重复发送低空间通知
+            
+            if not has_space:
+                disk_monitor.space_low = True
+                
+                # 发送低空间通知（如果超过冷却时间）
+                if (current_time - disk_monitor.last_notification_time) > notification_cooldown:
+                    message = (
+                        f"⚠️ 磁盘空间不足\n"
+                        f"可用空间: {available_gb}GB / {total_gb}GB\n"
+                        f"阈值: {threshold_gb}GB\n"
+                        f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    )
+                    
+                    if await send_bark_notification("磁盘空间警告", message):
+                        disk_monitor.last_notification_time = current_time
+                        
+            else:
+                # 如果之前空间不足但现在恢复，发送恢复通知
+                if disk_monitor.space_low:
+                    disk_monitor.space_low = False
+                    message = (
+                        f"✅ 磁盘空间已恢复\n"
+                        f"可用空间: {available_gb}GB / {total_gb}GB\n"
+                        f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    )
+                    await send_bark_notification("磁盘空间恢复", message)
+                    
+                    # 恢复暂停的worker
+                    if disk_monitor.paused_workers:
+                        logger.info("磁盘空间恢复，准备恢复下载任务...")
+                        disk_monitor.paused_workers.clear()
+            
+            # 等待下一次检查
+            await asyncio.sleep(check_interval)
+            
+        except Exception as e:
+            logger.error(f"磁盘空间监控任务出错: {e}")
+            await asyncio.sleep(60)
+
+async def stats_notification_task():
+    """定期统计信息通知任务"""
+    while getattr(app, 'is_running', True):
+        try:
+            bark_config = getattr(app, 'bark_notification', {})
+            interval = bark_config.get('stats_notification_interval', 3600)
+            
+            # 等待间隔时间
+            await asyncio.sleep(interval)
+            
+            # 检查是否需要发送统计通知
+            events_to_notify = bark_config.get('events_to_notify', [])
+            if 'stats_summary' not in events_to_notify:
+                continue
+                
+            # 收集统计信息
+            stats = collect_stats()
+            
+            # 构建通知消息
+            message = (
+                f"📊 统计摘要\n"
+                f"运行时间: {stats['uptime']}\n"
+                f"完成任务: {stats['tasks_completed']}\n"
+                f"失败任务: {stats['tasks_failed']}\n"
+                f"跳过任务: {stats['tasks_skipped']}\n"
+                f"下载大小: {stats['download_size_mb']:.2f}MB\n"
+                f"磁盘可用: {stats['disk_available_gb']:.2f}GB\n"
+                f"活动任务: {stats['active_tasks']}\n"
+                f"队列任务: {stats['queued_tasks']}\n"
+                f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+            
+            await send_bark_notification("下载统计", message)
+            
+            # 重置统计
+            disk_monitor.stats_since_last_notification = {
+                "tasks_completed": 0,
+                "tasks_failed": 0,
+                "tasks_skipped": 0,
+                "download_size": 0
+            }
+            
+        except Exception as e:
+            logger.error(f"统计通知任务出错: {e}")
+
+def collect_stats() -> Dict[str, Any]:
+    """收集统计信息"""
+    try:
+        # 运行时间
+        uptime = datetime.now() - disk_monitor.stats_start_time
+        uptime_str = str(uptime).split('.')[0]
+        
+        # 磁盘空间
+        _, available_gb, total_gb = asyncio.run(check_disk_space())
+        
+        # 应用统计
+        tasks_completed = getattr(app, 'total_download_task', 0)
+        tasks_failed = len(disk_monitor.paused_workers)
+        tasks_skipped = 0  # 可以扩展
+        
+        # 队列状态
+        queued_tasks = queue.qsize() if hasattr(queue, 'qsize') else 0
+        
+        return {
+            "uptime": uptime_str,
+            "tasks_completed": tasks_completed,
+            "tasks_failed": tasks_failed,
+            "tasks_skipped": tasks_skipped,
+            "download_size_mb": disk_monitor.stats_since_last_notification["download_size"] / (1024**2),
+            "disk_available_gb": available_gb,
+            "disk_total_gb": total_gb,
+            "active_tasks": app.max_download_task - len(disk_monitor.paused_workers),
+            "queued_tasks": queued_tasks,
+            "space_low": disk_monitor.space_low
+        }
+    except Exception as e:
+        logger.error(f"收集统计信息失败: {e}")
+        return {}
 
 def setup_exit_signal_handlers():
     """设置优雅退出的信号处理器"""
@@ -463,6 +677,17 @@ async def download_task(
     client: pyrogram.Client, message: pyrogram.types.Message, node: TaskNode
 ):
     """Download and Forward media"""
+    original_download_status, file_name = await download_media(
+        client, message, app.media_types, app.file_formats, node
+    )
+
+    # 记录下载文件大小
+    if file_name and os.path.exists(file_name):
+        try:
+            file_size = os.path.getsize(file_name)
+            disk_monitor.stats_since_last_notification["download_size"] += file_size
+        except:
+            pass
 
     download_status, file_name = await download_media(
         client, message, app.media_types, app.file_formats, node
@@ -717,6 +942,33 @@ async def worker(client: pyrogram.client.Client):
     logger.debug(f"Worker {worker_id} 启动")
     
     while getattr(app, 'is_running', True) and not getattr(app, 'force_exit', False):
+        try:
+            # 检查磁盘空间
+            bark_config = getattr(app, 'bark_notification', {})
+            threshold_gb = bark_config.get('disk_space_threshold_gb', 10.0)
+            
+            has_space, available_gb, _ = await check_disk_space(threshold_gb)
+            
+            if not has_space:
+                # 磁盘空间不足，暂停此worker
+                if worker_id not in disk_monitor.paused_workers:
+                    logger.warning(f"Worker {worker_id}: 磁盘空间不足 ({available_gb}GB < {threshold_gb}GB)，暂停下载")
+                    disk_monitor.paused_workers.add(worker_id)
+                    
+                    # 发送暂停通知
+                    events_to_notify = bark_config.get('events_to_notify', [])
+                    if 'task_paused' in events_to_notify:
+                        message = f"Worker {worker_id}: 因磁盘空间不足暂停下载\n可用空间: {available_gb}GB"
+                        await send_bark_notification("下载任务暂停", message)
+                
+                # 等待一段时间再检查
+                await asyncio.sleep(60)
+                continue
+            else:
+                # 磁盘空间足够，如果之前暂停则恢复
+                if worker_id in disk_monitor.paused_workers:
+                    logger.info(f"Worker {worker_id}: 磁盘空间恢复，继续下载")
+                    disk_monitor.paused_workers.discard(worker_id)
         try:
             # 使用带超时的get，避免阻塞
             try:
@@ -976,6 +1228,7 @@ def main():
             sys.exit(1)
     
     tasks = []
+    monitor_tasks = []  # 监控任务列表
     client = HookClient(
         "media_downloader",
         api_id=app.api_id,
@@ -1008,6 +1261,17 @@ def main():
         for chat_id, config in app.chat_download_config.items():
             logger.info(f"  聊天 {chat_id}: 最后读取消息ID: {config.last_read_message_id}")
         # ======================================
+        # 发送启动通知
+        if getattr(app, 'bark_notification', {}).get('enabled', False):
+            events_to_notify = app.bark_notification.get('events_to_notify', [])
+            if 'startup' in events_to_notify:
+                startup_msg = (
+                    f"✅ Telegram媒体下载器已启动\n"
+                    f"版本: 2.2.5\n"
+                    f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"配置聊天数: {len(app.chat_download_config)}"
+                )
+                asyncio.create_task(send_bark_notification("程序启动", startup_msg))
         
         # 设置force_exit标志
         if not hasattr(app, 'force_exit'):
@@ -1020,7 +1284,17 @@ def main():
             task = app.loop.create_task(worker(client))
             tasks.append(task)
             logger.debug(f"启动 Worker {i+1}/{app.max_download_task}")
-        
+                # 启动监控任务
+        if getattr(app, 'bark_notification', {}).get('enabled', False):
+            # 磁盘空间监控
+            disk_monitor_task_obj = app.loop.create_task(disk_space_monitor_task())
+            monitor_tasks.append(disk_monitor_task_obj)
+            
+            # 统计通知任务
+            stats_task_obj = app.loop.create_task(stats_notification_task())
+            monitor_tasks.append(stats_task_obj)
+            
+            logger.info("磁盘空间监控和统计通知已启用")
         if app.bot_token:
             app.loop.run_until_complete(
                 start_download_bot(app, client, add_download_task, download_chat_task)
@@ -1049,6 +1323,21 @@ def main():
     except Exception as e:
         logger.exception("{}", e)
     finally:
+        # 发送关闭通知
+        if getattr(app, 'is_running', False) and getattr(app, 'bark_notification', {}).get('enabled', False):
+            events_to_notify = app.bark_notification.get('events_to_notify', [])
+            if 'shutdown' in events_to_notify:
+                stats = collect_stats()
+                shutdown_msg = (
+                    f"🛑 Telegram媒体下载器已停止\n"
+                    f"运行时间: {stats.get('uptime', 'N/A')}\n"
+                    f"完成任务: {stats.get('tasks_completed', 0)}\n"
+                    f"失败任务: {stats.get('tasks_failed', 0)}\n"
+                    f"磁盘可用: {stats.get('disk_available_gb', 0):.2f}GB\n"
+                    f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+                # 使用run_until_complete发送同步通知
+                app.loop.run_until_complete(send_bark_notification("程序停止", shutdown_msg))
         if hasattr(app, 'is_running'):
             app.is_running = False
         
@@ -1058,7 +1347,10 @@ def main():
         logger.info(f"当前队列剩余任务: {queue.qsize()}")
         logger.info("=" * 60)
         # ======================================
-        
+
+        # 取消监控任务
+        for task in monitor_tasks:
+            task.cancel()
         # 快速退出，不再等待队列
         logger.info("正在停止所有任务...")
         
