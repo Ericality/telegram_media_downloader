@@ -4,10 +4,10 @@ import asyncio
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Callable, List, Optional, Union
+from typing import Callable, List, Optional, Union, Dict, Any, Type
 
 from loguru import logger
 from ruamel import yaml
@@ -337,6 +337,75 @@ def get_config(config, key, default=None, val_type=str, verbose=True):
     return default
 
 
+class ConfigSchema:
+    """配置架构定义，描述每个配置项的默认值、类型和转换函数"""
+    
+    # 基础配置架构
+    BASE_CONFIG = {
+        # 键名: (默认值, 类型, 转换函数或None)
+        "api_id": ("", str, None),
+        "api_hash": ("", str, None),
+        "bot_token": ("", str, None),
+        "save_path": (os.path.join(os.path.abspath("."), "downloads"), str, None),
+        "temp_save_path": (os.path.join(os.path.abspath("."), "temp"), str, None),
+        "media_types": ([], list, None),
+        "file_formats": ({}, dict, None),
+        "proxy": ({}, dict, None),
+        "restart_program": (False, bool, None),
+        "file_path_prefix": (["chat_title", "media_datetime"], list, None),
+        "file_name_prefix": (["message_id", "file_name"], list, None),
+        "file_name_prefix_split": (" - ", str, None),
+        "log_file_path": (os.path.join(os.path.abspath("."), "log"), str, None),
+        "session_file_path": (os.path.join(os.path.abspath("."), "sessions"), str, None),
+        "hide_file_name": (False, bool, None),
+        "max_concurrent_transmissions": (5, int, None),
+        "web_host": ("0.0.0.0", str, None),
+        "web_port": (5000, int, None),
+        "max_download_task": (5, int, None),
+        "language": (Language.EN, Language, lambda x: Language[x.upper()] if isinstance(x, str) else x),
+        "after_upload_telegram_delete": (True, bool, None),
+        "web_login_secret": ("", str, lambda x: str(x)),
+        "debug_web": (False, bool, None),
+        "log_level": ("INFO", str, None),
+        "start_timeout": (60, int, None),
+        "allowed_user_ids": (yaml.comments.CommentedSeq([]), yaml.comments.CommentedSeq, None),
+        "date_format": ("%Y_%m", str, None),
+        "drop_no_audio_video": (False, bool, None),
+        "enable_download_txt": (False, bool, None),
+        "bark_notification": ({
+            'enabled': False,
+            'url': '',
+            'disk_space_threshold_gb': 10.0,
+            'space_check_interval': 300,
+            'stats_notification_interval': 3600,
+            'notify_worker_count': 1,
+            'events_to_notify': []
+        }, dict, None),
+        "forward_limit": (33, int, None),
+    }
+    
+    @classmethod
+    def get_default(cls, key):
+        """获取配置项的默认值"""
+        if key in cls.BASE_CONFIG:
+            return cls.BASE_CONFIG[key][0]
+        return None
+    
+    @classmethod
+    def get_type(cls, key):
+        """获取配置项的类型"""
+        if key in cls.BASE_CONFIG:
+            return cls.BASE_CONFIG[key][1]
+        return type(None)
+    
+    @classmethod
+    def get_converter(cls, key):
+        """获取配置项的转换函数"""
+        if key in cls.BASE_CONFIG:
+            return cls.BASE_CONFIG[key][2]
+        return None
+
+
 class Application:
     """Application load config and update config."""
 
@@ -368,48 +437,17 @@ class Application:
         self.is_running = True
 
         self.total_download_task = 0
-
         self.chat_download_config: dict = {}
-
-        self.save_path = os.path.join(os.path.abspath("."), "downloads")
-        self.temp_save_path = os.path.join(os.path.abspath("."), "temp")
-        self.api_id: str = ""
-        self.api_hash: str = ""
-        self.bot_token: str = ""
-        self._chat_id: str = ""
-        self.media_types: List[str] = []
-        self.file_formats: dict = {}
-        self.proxy: dict = {}
-        self.restart_program = False
         self.config: dict = {}
         self.app_data: dict = {}
-        self.file_path_prefix: List[str] = ["chat_title", "media_datetime"]
-        self.file_name_prefix: List[str] = ["message_id", "file_name"]
-        self.file_name_prefix_split: str = " - "
-        self.log_file_path = os.path.join(os.path.abspath("."), "log")
-        self.session_file_path = os.path.join(os.path.abspath("."), "sessions")
         self.cloud_drive_config = CloudDriveConfig()
-        self.hide_file_name = False
         self.caption_name_dict: dict = {}
         self.caption_entities_dict: dict = {}
-        self.max_concurrent_transmissions: int = 1
-        self.web_host: str = "0.0.0.0"
-        self.web_port: int = 5000
-        self.max_download_task: int = 5
-        self.language = Language.EN
-        self.after_upload_telegram_delete: bool = True
-        self.web_login_secret: str = ""
-        self.debug_web: bool = False
-        self.log_level: str = "INFO"
-        self.start_timeout: int = 60
-        self.allowed_user_ids: yaml.comments.CommentedSeq = yaml.comments.CommentedSeq(
-            []
-        )
-        self.date_format: str = "%Y_%m"
-        self.drop_no_audio_video: bool = False
-        self.enable_download_txt: bool = False
-
-        self.forward_limit_call = LimitCall(max_limit_call_times=33)
+        
+        # 使用配置架构初始化所有配置项
+        self._init_config_from_schema()
+        
+        self.forward_limit_call = LimitCall(max_limit_call_times=self.forward_limit)
 
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
@@ -418,7 +456,45 @@ class Application:
             min(32, (os.cpu_count() or 0) + 4), thread_name_prefix="multi_task"
         )
 
-    # pylint: disable = R0915
+    def _init_config_from_schema(self):
+        """根据配置架构初始化所有配置项"""
+        for key, (default_value, value_type, converter) in ConfigSchema.BASE_CONFIG.items():
+            setattr(self, key, default_value)
+    
+    def _load_and_convert_value(self, key: str, raw_value: Any) -> Any:
+        """加载并转换配置值"""
+        try:
+            converter = ConfigSchema.get_converter(key)
+            expected_type = ConfigSchema.get_type(key)
+            
+            if converter:
+                # 使用转换函数
+                converted_value = converter(raw_value)
+            else:
+                # 直接赋值，但检查类型
+                converted_value = raw_value
+            
+            # 类型检查
+            if expected_type and not isinstance(converted_value, expected_type):
+                logger.warning(f"配置项 {key} 的类型不符合预期: "
+                             f"期望 {expected_type.__name__}, 实际 {type(converted_value).__name__}")
+                # 尝试类型转换
+                try:
+                    if expected_type == bool:
+                        converted_value = str(converted_value).lower() in ('true', '1', 'yes', 'on')
+                    else:
+                        converted_value = expected_type(converted_value)
+                except (ValueError, TypeError):
+                    # 转换失败，使用默认值
+                    default_value = ConfigSchema.get_default(key)
+                    logger.warning(f"配置项 {key} 类型转换失败，使用默认值: {default_value}")
+                    converted_value = default_value
+            
+            return converted_value
+        except Exception as e:
+            logger.error(f"处理配置项 {key} 时出错: {e}")
+            return ConfigSchema.get_default(key)
+    
     def assign_config(self, _config: dict) -> bool:
         """assign config from str.
 
@@ -431,31 +507,111 @@ class Application:
         -------
         bool
         """
-        # pylint: disable = R0912
-        # TODO: judge the storage if enough,and provide more path
-        if _config.get("save_path") is not None:
+        # 处理特殊配置项（需要复杂逻辑的）
+        self._process_special_configs(_config)
+        
+        # 处理通用配置项
+        self._process_general_configs(_config)
+        
+        # 处理聊天配置
+        self._process_chat_configs(_config)
+        
+        # 处理云存储配置
+        self._process_cloud_drive_config(_config)
+        
+        # 处理日期格式
+        self._validate_date_format()
+        
+        # 处理聊天配置的过滤器
+        self._process_chat_filters()
+        
+        return True
+    
+    def _process_special_configs(self, _config: dict):
+        """处理需要特殊逻辑的配置项"""
+        # 从配置中提取特殊的配置项并设置
+        if "save_path" in _config:
             self.save_path = _config["save_path"]
+        
+        # 媒体类型和文件格式是必须的
+        if "media_types" in _config:
+            self.media_types = _config["media_types"]
+        if "file_formats" in _config:
+            self.file_formats = _config["file_formats"]
+    
+    def _process_general_configs(self, _config: dict):
+        """处理通用配置项"""
+        # 遍历配置架构中的所有键
+        for key in ConfigSchema.BASE_CONFIG.keys():
+            if key in _config:
+                raw_value = _config[key]
+                converted_value = self._load_and_convert_value(key, raw_value)
+                setattr(self, key, converted_value)
+                
+                # 记录日志（可选）
+                if key in ['api_id', 'api_hash', 'bot_token', 'web_login_secret']:
+                    masked_value = '****' if raw_value else ''
+                    logger.debug(f"加载配置 {key}: {masked_value}")
+                else:
+                    logger.debug(f"加载配置 {key}: {raw_value}")
+    
+    def _process_chat_configs(self, _config: dict):
+        """处理聊天配置"""
+        if "chat" in _config:
+            chat = _config["chat"]
+            for item in chat:
+                if "chat_id" in item:
+                    self.chat_download_config[item["chat_id"]] = ChatDownloadConfig()
+                    self.chat_download_config[
+                        item["chat_id"]
+                    ].last_read_message_id = item.get("last_read_message_id", 0)
+                    self.chat_download_config[
+                        item["chat_id"]
+                    ].download_filter = item.get("download_filter", "")
+                    self.chat_download_config[
+                        item["chat_id"]
+                    ].upload_telegram_chat_id = item.get(
+                        "upload_telegram_chat_id", None
+                    )
+        elif "chat_id" in _config:
+            # 兼容旧版本
+            self._chat_id = _config["chat_id"]
+            self.chat_download_config[self._chat_id] = ChatDownloadConfig()
 
-        self.api_id = _config["api_id"]
-        self.api_hash = _config["api_hash"]
-        self.bot_token = _config.get("bot_token", "")
+            if "ids_to_retry" in _config:
+                self.chat_download_config[self._chat_id].ids_to_retry = _config[
+                    "ids_to_retry"
+                ]
+                for it in self.chat_download_config[self._chat_id].ids_to_retry:
+                    self.chat_download_config[self._chat_id].ids_to_retry_dict[
+                        it
+                    ] = True
 
-        self.media_types = _config["media_types"]
-        self.file_formats = _config["file_formats"]
+            self.chat_download_config[self._chat_id].last_read_message_id = _config.get(
+                "last_read_message_id", 0
+            )
+            download_filter_dict = _config.get("download_filter", None)
 
-        self.hide_file_name = _config.get("hide_file_name", False)
+            self.config["chat"] = [
+                {
+                    "chat_id": self._chat_id,
+                    "last_read_message_id": self.chat_download_config[
+                        self._chat_id
+                    ].last_read_message_id,
+                }
+            ]
 
-        # option
-        if _config.get("proxy"):
-            self.proxy = _config["proxy"]
-        if _config.get("restart_program"):
-            self.restart_program = _config["restart_program"]
-        if _config.get("file_path_prefix"):
-            self.file_path_prefix = _config["file_path_prefix"]
-        if _config.get("file_name_prefix"):
-            self.file_name_prefix = _config["file_name_prefix"]
-
-        if _config.get("upload_drive"):
+            if download_filter_dict and self._chat_id in download_filter_dict:
+                self.chat_download_config[
+                    self._chat_id
+                ].download_filter = download_filter_dict[self._chat_id]
+                self.config["chat"][0]["download_filter"] = download_filter_dict[
+                    self._chat_id
+                ]
+    
+    def _process_cloud_drive_config(self, _config: dict):
+        """处理云存储配置"""
+        if "upload_drive" in _config:
             upload_drive_config = _config["upload_drive"]
             if upload_drive_config.get("enable_upload_file"):
                 self.cloud_drive_config.enable_upload_file = upload_drive_config[
@@ -482,143 +638,22 @@ class Application:
                 self.cloud_drive_config.upload_adapter = upload_drive_config[
                     "upload_adapter"
                 ]
-
-        self.file_name_prefix_split = _config.get(
-            "file_name_prefix_split", self.file_name_prefix_split
-        )
-        self.web_host = _config.get("web_host", self.web_host)
-        self.web_port = _config.get("web_port", self.web_port)
-
-        # TODO: add check if expression exist syntax error
-
-        self.max_download_task = _config.get(
-            "max_download_task", self.max_download_task
-        )
-
-        self.max_concurrent_transmissions = self.max_download_task * 5
-
-        self.max_concurrent_transmissions = _config.get(
-            "max_concurrent_transmissions", self.max_concurrent_transmissions
-        )
-
-        language = _config.get("language", "EN")
-
-        try:
-            self.language = Language[language.upper()]
-        except KeyError:
-            pass
-
-        self.after_upload_telegram_delete = _config.get(
-            "after_upload_telegram_delete", self.after_upload_telegram_delete
-        )
-
-        self.web_login_secret = str(
-            _config.get("web_login_secret", self.web_login_secret)
-        )
-        self.debug_web = _config.get("debug_web", self.debug_web)
-        self.log_level = _config.get("log_level", self.log_level)
-
-        self.start_timeout = get_config(
-            _config, "start_timeout", self.start_timeout, int
-        )
-
-        self.allowed_user_ids = get_config(
-            _config,
-            "allowed_user_ids",
-            self.allowed_user_ids,
-            yaml.comments.CommentedSeq,
-        )
-
-        self.date_format = get_config(
-            _config,
-            "date_format",
-            self.date_format,
-            str,
-        )
-
-        self.drop_no_audio_video = get_config(
-            _config, "drop_no_audio_video", self.drop_no_audio_video, bool
-        )
-
-        self.enable_download_txt = get_config(
-            _config, "enable_download_txt", self.enable_download_txt, bool
-        )
-
+    
+    def _validate_date_format(self):
+        """验证日期格式"""
         try:
             date = datetime(2023, 10, 31)
             date.strftime(self.date_format)
         except Exception as e:
-            logger.warning(f"config date format error: {e}")
+            logger.warning(f"配置日期格式错误: {e}")
             self.date_format = "%Y_%m"
-
-        forward_limit = _config.get("forward_limit", None)
-        if forward_limit:
-            try:
-                forward_limit = int(forward_limit)
-                self.forward_limit_call.max_limit_call_times = forward_limit
-            except ValueError:
-                pass
-
-        if _config.get("chat"):
-            chat = _config["chat"]
-            for item in chat:
-                if "chat_id" in item:
-                    self.chat_download_config[item["chat_id"]] = ChatDownloadConfig()
-                    self.chat_download_config[
-                        item["chat_id"]
-                    ].last_read_message_id = item.get("last_read_message_id", 0)
-                    self.chat_download_config[
-                        item["chat_id"]
-                    ].download_filter = item.get("download_filter", "")
-                    self.chat_download_config[
-                        item["chat_id"]
-                    ].upload_telegram_chat_id = item.get(
-                        "upload_telegram_chat_id", None
-                    )
-        elif _config.get("chat_id"):
-            # Compatible with lower versions
-            self._chat_id = _config["chat_id"]
-
-            self.chat_download_config[self._chat_id] = ChatDownloadConfig()
-
-            if _config.get("ids_to_retry"):
-                self.chat_download_config[self._chat_id].ids_to_retry = _config[
-                    "ids_to_retry"
-                ]
-                for it in self.chat_download_config[self._chat_id].ids_to_retry:
-                    self.chat_download_config[self._chat_id].ids_to_retry_dict[
-                        it
-                    ] = True
-
-            self.chat_download_config[self._chat_id].last_read_message_id = _config[
-                "last_read_message_id"
-            ]
-            download_filter_dict = _config.get("download_filter", None)
-
-            self.config["chat"] = [
-                {
-                    "chat_id": self._chat_id,
-                    "last_read_message_id": self.chat_download_config[
-                        self._chat_id
-                    ].last_read_message_id,
-                }
-            ]
-
-            if download_filter_dict and self._chat_id in download_filter_dict:
-                self.chat_download_config[
-                    self._chat_id
-                ].download_filter = download_filter_dict[self._chat_id]
-                self.config["chat"][0]["download_filter"] = download_filter_dict[
-                    self._chat_id
-                ]
-
-        # pylint: disable = R1733
+    
+    def _process_chat_filters(self):
+        """处理聊天过滤器"""
         for key, value in self.chat_download_config.items():
             self.chat_download_config[key].download_filter = replace_date_time(
                 value.download_filter
             )
-
-        return True
 
     def assign_app_data(self, app_data: dict) -> bool:
         """Assign config from str.
@@ -871,7 +906,7 @@ class Application:
                 _yaml.dump(self.config, yaml_file)
 
         if immediate:
-            with open(self.app_data_file, "w", encoding="utf-8") as yaml_file:
+            with open(self.app_data_file, "w", encoding='utf-8') as yaml_file:
                 _yaml.dump(self.app_data, yaml_file)
 
     def set_language(self, language: Language):
