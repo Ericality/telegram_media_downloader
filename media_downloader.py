@@ -1311,17 +1311,6 @@ def main():
         for chat_id, config in app.chat_download_config.items():
             logger.info(f"  聊天 {chat_id}: 最后读取消息ID: {config.last_read_message_id}")
         # ======================================
-        # 发送启动通知
-        if getattr(app, 'bark_notification', {}).get('enabled', False):
-            events_to_notify = app.bark_notification.get('events_to_notify', [])
-            if 'startup' in events_to_notify:
-                startup_msg = (
-                    f"✅ Telegram媒体下载器已启动\n"
-                    f"版本: 2.2.5\n"
-                    f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"配置聊天数: {len(app.chat_download_config)}"
-                )
-                asyncio.create_task(send_bark_notification("程序启动", startup_msg))
         
         # 设置force_exit标志
         if not hasattr(app, 'force_exit'):
@@ -1334,7 +1323,18 @@ def main():
             task = app.loop.create_task(worker(client))
             tasks.append(task)
             logger.debug(f"启动 Worker {i+1}/{app.max_download_task}")
-        
+
+        # 发送启动通知
+        if getattr(app, 'bark_notification', {}).get('enabled', False):
+            events_to_notify = app.bark_notification.get('events_to_notify', [])
+            if 'startup' in events_to_notify:
+                startup_msg = (
+                    f"✅ Telegram媒体下载器已启动\n"
+                    f"版本: 2.2.5\n"
+                    f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"配置聊天数: {len(app.chat_download_config)}"
+                )
+                asyncio.create_task(send_bark_notification("程序启动", startup_msg))
         # 启动监控任务
         if getattr(app, 'bark_notification', {}).get('enabled', False):
             # 磁盘空间监控
