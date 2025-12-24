@@ -1237,15 +1237,6 @@ def main():
     logger.info("Telegram Media Downloader 启动")
     logger.info("=" * 60)
     logger.info("检查Bark通知配置...")
-    try:
-        bark_config = getattr(app, 'bark_notification', {})
-        logger.info(f"Bark配置: {bark_config}")
-        logger.info(f"Bark启用状态: {bark_config.get('enabled', False)}")
-        logger.info(f"Bark URL: {bark_config.get('url', '未设置')}")
-        logger.info(f"通知事件列表: {bark_config.get('events_to_notify', [])}")
-    except Exception as e:
-        logger.error(f"检查Bark配置时出错: {e}")
-    
     # ===================================
     
     # 添加全局异常处理
@@ -1279,6 +1270,27 @@ def main():
     try:
         app.pre_run()
         init_web(app)
+
+        # ========== 立即修复：手动加载 Bark 配置 ==========
+        import yaml
+        try:
+            with open(CONFIG_NAME, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f)
+                # 将 bark_notification 配置赋给 app 对象
+                app.bark_notification = config.get('bark_notification', {})
+                logger.info(f"手动加载 Bark 配置成功: enabled={app.bark_notification.get('enabled', False)}")
+        except Exception as e:
+            logger.error(f"手动加载 Bark 配置失败: {e}")
+            app.bark_notification = {}
+        # ================================================
+        try:
+            bark_config = getattr(app, 'bark_notification', {})
+            logger.info(f"Bark配置: {bark_config}")
+            logger.info(f"Bark启用状态: {bark_config.get('enabled', False)}")
+            logger.info(f"Bark URL: {bark_config.get('url', '未设置')}")
+            logger.info(f"通知事件列表: {bark_config.get('events_to_notify', [])}")
+        except Exception as e:
+            logger.error(f"检查Bark配置时出错: {e}")
         
         # 设置全局异常处理器
         app.loop.set_exception_handler(global_exception_handler)
