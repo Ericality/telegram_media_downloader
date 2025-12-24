@@ -154,17 +154,25 @@ async def send_bark_notification(title: str, body: str, url: str = None):
         # 从配置获取URL
         if not url:
             bark_config = getattr(app, 'bark_notification', {})
+            logger.debug(f"获取到Bark配置: {bark_config}")
+            
             if not bark_config.get('enabled', False):
+                logger.debug("Bark通知未启用，跳过")
                 return False
+                
             url = bark_config.get('url', '')
+            logger.debug(f"使用Bark URL: {url}")
             
         if not url:
+            logger.warning("Bark URL为空，无法发送通知")
             return False
             
         # 确保URL格式正确
         if not url.startswith('http'):
             url = f"https://{url}"
             
+        logger.info(f"正在发送Bark通知: {title}")
+        
         # 构建请求数据
         payload = {
             "title": title,
@@ -173,19 +181,29 @@ async def send_bark_notification(title: str, body: str, url: str = None):
             "icon": "https://telegram.org/img/t_logo.png"  # 可选：图标
         }
         
+        logger.debug(f"Bark请求Payload: {payload}")
+        
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, timeout=10) as response:
+                response_text = await response.text()
                 if response.status == 200:
-                    logger.info(f"Bark通知已发送: {title}")
+                    logger.success(f"Bark通知已发送: {title}")
+                    logger.debug(f"Bark响应: {response_text}")
                     return True
                 else:
-                    logger.warning(f"Bark通知发送失败: {response.status}")
+                    logger.warning(f"Bark通知发送失败: HTTP {response.status}")
+                    logger.debug(f"Bark响应内容: {response_text}")
                     return False
                     
-    except Exception as e:
-        logger.error(f"发送Bark通知时出错: {e}")
+    except aiohttp.ClientError as e:
+        logger.error(f"Bark网络请求错误: {e}")
         return False
-
+    except asyncio.TimeoutError:
+        logger.error("Bark请求超时")
+        return False
+    except Exception as e:
+        logger.error(f"发送Bark通知时出错: {e}", exc_info=True)
+        return False
 async def disk_space_monitor_task():
     """磁盘空间监控任务"""
     while getattr(app, 'is_running', True):
@@ -1218,6 +1236,7 @@ def main():
     logger.info("=" * 60)
     logger.info("Telegram Media Downloader 启动")
     logger.info("=" * 60)
+    
     # ===================================
     
     # 添加全局异常处理
