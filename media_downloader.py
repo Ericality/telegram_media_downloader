@@ -1236,6 +1236,15 @@ def main():
     logger.info("=" * 60)
     logger.info("Telegram Media Downloader 启动")
     logger.info("=" * 60)
+    logger.info("检查Bark通知配置...")
+    try:
+        bark_config = getattr(app, 'bark_notification', {})
+        logger.info(f"Bark配置: {bark_config}")
+        logger.info(f"Bark启用状态: {bark_config.get('enabled', False)}")
+        logger.info(f"Bark URL: {bark_config.get('url', '未设置')}")
+        logger.info(f"通知事件列表: {bark_config.get('events_to_notify', [])}")
+    except Exception as e:
+        logger.error(f"检查Bark配置时出错: {e}")
     
     # ===================================
     
