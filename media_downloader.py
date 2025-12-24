@@ -1334,7 +1334,7 @@ def main():
                     f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                     f"配置聊天数: {len(app.chat_download_config)}"
                 )
-                asyncio.create_task(send_bark_notification("程序启动", startup_msg))
+                app.loop.create_task()(send_bark_notification("程序启动", startup_msg))
         # 启动监控任务
         if getattr(app, 'bark_notification', {}).get('enabled', False):
             # 磁盘空间监控
