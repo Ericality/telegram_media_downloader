@@ -11,6 +11,8 @@ import time
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple, Union, Dict, Any
 
+import aiohttp  # 新增导入
+import psutil  # 新增导入
 import pyrogram
 from loguru import logger
 from pyrogram.types import Audio, Document, Photo, Video, VideoNote, Voice
@@ -406,6 +408,7 @@ async def record_failed_task(chat_id: Union[int, str], message_id: int, error_ms
             
     except Exception as e:
         logger.error(f"记录失败任务时出错: {e}")
+
 async def load_failed_tasks(chat_id: Union[int, str]) -> list:
     """加载失败的任务"""
     try:
@@ -677,6 +680,7 @@ async def download_task(
     client: pyrogram.Client, message: pyrogram.types.Message, node: TaskNode
 ):
     """Download and Forward media"""
+    # 修复：移除重复的 download_media 调用
     original_download_status, file_name = await download_media(
         client, message, app.media_types, app.file_formats, node
     )
@@ -689,12 +693,12 @@ async def download_task(
         except:
             pass
 
-    download_status, file_name = await download_media(
-        client, message, app.media_types, app.file_formats, node
-    )
+    # 注意：原代码这里调用了两次 download_media，已移除重复调用
 
     if app.enable_download_txt and message.text and not message.media:
         download_status, file_name = await save_msg_to_file(app, node.chat_id, message)
+    else:
+        download_status, file_name = original_download_status, file_name
 
     if not node.bot:
         app.set_download_id(node, message.id, download_status)
@@ -969,6 +973,11 @@ async def worker(client: pyrogram.client.Client):
                 if worker_id in disk_monitor.paused_workers:
                     logger.info(f"Worker {worker_id}: 磁盘空间恢复，继续下载")
                     disk_monitor.paused_workers.discard(worker_id)
+        except Exception as e:
+            logger.exception(f"Worker {worker_id} 检查磁盘空间时异常: {e}")
+            await asyncio.sleep(60)
+            continue
+
         try:
             # 使用带超时的get，避免阻塞
             try:
@@ -1159,6 +1168,7 @@ async def download_chat_task(
     # ========== 新增：任务统计 ==========
     logger.info(f"任务添加完成，共 {node.total_task} 个任务等待下载")
     # ===================================
+
 async def download_all_chat(client: pyrogram.Client):
     """Download All chat"""
     for key, value in app.chat_download_config.items():
@@ -1284,7 +1294,8 @@ def main():
             task = app.loop.create_task(worker(client))
             tasks.append(task)
             logger.debug(f"启动 Worker {i+1}/{app.max_download_task}")
-                # 启动监控任务
+        
+        # 启动监控任务
         if getattr(app, 'bark_notification', {}).get('enabled', False):
             # 磁盘空间监控
             disk_monitor_task_obj = app.loop.create_task(disk_space_monitor_task())
@@ -1295,6 +1306,7 @@ def main():
             monitor_tasks.append(stats_task_obj)
             
             logger.info("磁盘空间监控和统计通知已启用")
+        
         if app.bot_token:
             app.loop.run_until_complete(
                 start_download_bot(app, client, add_download_task, download_chat_task)
@@ -1338,6 +1350,7 @@ def main():
                 )
                 # 使用run_until_complete发送同步通知
                 app.loop.run_until_complete(send_bark_notification("程序停止", shutdown_msg))
+        
         if hasattr(app, 'is_running'):
             app.is_running = False
         
@@ -1407,6 +1420,7 @@ def main():
                     logger.info(f"  聊天 {chat_id}: {len(tasks_list)} 个失败任务")
         except:
             pass
+
 if __name__ == "__main__":
     if _check_config():
         main()
