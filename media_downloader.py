@@ -1358,7 +1358,28 @@ def main():
         
         # ========== 配置调试信息 ==========
         logger.info("正在验证配置...")
-        
+        # 检查配置加载情况
+        logger.info("检查配置加载情况...")
+
+        # 检查config字典
+        if hasattr(app, 'config') and app.config:
+            logger.info(f"config字典中的键: {list(app.config.keys())}")
+            if 'bark_notification' in app.config:
+                logger.info(f"config中找到bark_notification: {app.config['bark_notification']}")
+            else:
+                logger.warning("config中未找到bark_notification")
+        else:
+            logger.error("app.config不存在或为空")
+
+        # 检查app对象的bark_notification属性
+        if hasattr(app, 'bark_notification'):
+            logger.info(f"app.bark_notification存在，类型: {type(app.bark_notification)}，值: {app.bark_notification}")
+        else:
+            logger.error("app.bark_notification属性不存在!")
+
+        # 检查Application类是否已修复
+        logger.info("检查Application类配置...")
+        logger.info(f"Application类是否有bark_notification属性: {hasattr(app.__class__, 'bark_notification')}")
         # 打印配置摘要
         print_config_summary(app)
         
