@@ -394,54 +394,98 @@ def setup_exit_signal_handlers():
         if hasattr(app, 'force_exit'):
             app.force_exit = True
 
-        # 强制取消所有任务
-        try:
-            # 取消所有异步任务
-            tasks = asyncio.all_tasks(app.loop)
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-        except:
-            pass
-
-        # 清空队列
-        try:
-            # 清空下载队列
-            while not download_queue.empty():
-                try:
-                    download_queue.get_nowait()
-                    download_queue.task_done()
-                except:
-                    break
-
-            # 清空通知队列
-            while not notify_queue.empty():
-                try:
-                    notify_queue.get_nowait()
-                    notify_queue.task_done()
-                except:
-                    break
-        except:
-            pass
-
         if signum == signal.SIGINT:
-            logger.info("正在退出，请稍候...")
-
-            # 设置3秒后强制退出
-            def force_exit():
-                logger.error("强制退出程序")
-                os._exit(1)
-
-            signal.signal(signal.SIGINT, lambda s, f: force_exit())
+            logger.info("正在停止所有任务，请稍候...")
         elif signum == signal.SIGTERM:
-            logger.info("收到终止信号，立即停止...")
-            try:
-                app.update_config()
-            except:
-                pass
+            logger.info("收到终止信号，正在停止...")
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+
+
+async def graceful_shutdown():
+    """优雅关闭所有组件"""
+    logger.info("开始优雅关闭...")
+
+    # 1. 停止添加新任务
+    if hasattr(app, 'is_running'):
+        app.is_running = False
+
+    # 2. 等待当前处理的任务完成（最多10秒）
+    logger.info("等待当前任务完成...")
+    wait_start = time.time()
+
+    while time.time() - wait_start < 10:
+        # 检查是否还有任务在处理
+        active_tasks = 0
+        for _, value in app.chat_download_config.items():
+            if hasattr(value, 'node') and value.node:
+                active_tasks += sum(1 for status in value.node.download_status.values()
+                                    if status == DownloadStatus.Downloading)
+
+        if active_tasks == 0:
+            logger.info("所有活动任务已完成")
+            break
+
+        logger.debug(f"还有 {active_tasks} 个任务在处理中...")
+        await asyncio.sleep(1)
+
+    # 3. 发送关闭通知（如果启用）
+    if hasattr(app, 'bark_notification') and app.bark_notification.get('enabled', False):
+        events_to_notify = app.bark_notification.get('events_to_notify', [])
+        if 'shutdown' in events_to_notify:
+            try:
+                shutdown_msg = (
+                    f"🛑 Telegram媒体下载器已停止\n"
+                    f"停止时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"下载队列剩余: {download_queue.qsize()}\n"
+                    f"通知队列剩余: {notify_queue.qsize()}"
+                )
+                await send_bark_notification("程序停止", shutdown_msg)
+            except Exception as e:
+                logger.error(f"发送停止通知失败: {e}")
+
+    # 4. 清空队列
+    logger.info("清空队列...")
+    try:
+        # 清空下载队列
+        while not download_queue.empty():
+            try:
+                download_queue.get_nowait()
+                download_queue.task_done()
+            except (asyncio.QueueEmpty, ValueError):
+                break
+
+        # 清空通知队列
+        while not notify_queue.empty():
+            try:
+                notify_queue.get_nowait()
+                notify_queue.task_done()
+            except (asyncio.QueueEmpty, ValueError):
+                break
+    except Exception as e:
+        logger.error(f"清空队列时出错: {e}")
+
+    logger.info("优雅关闭完成")
+
+
+async def run_until_all_task_finish():
+    """正常运行直到所有任务完成或收到退出信号"""
+    while True:
+        # 检查是否要退出
+        if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
+            logger.info("收到退出信号，准备退出...")
+            break
+
+        finish: bool = True
+        for _, value in app.chat_download_config.items():
+            if not value.need_check or value.total_task != value.finish_task:
+                finish = False
+
+        if (not app.bot_token and finish) or getattr(app, 'restart_program', False):
+            break
+
+        await asyncio.sleep(1)
 
 
 async def record_failed_task(chat_id: Union[int, str], message_id: int, error_msg: str):
@@ -813,10 +857,17 @@ async def download_media(
     task_start_time: float = time.time()
     media_size = 0
     _media = None
+    temp_file_name = None
+
+    # 检查是否要退出
+    if getattr(app, 'force_exit', False):
+        logger.debug(f"消息 {message.id}: 程序正在退出，跳过下载")
+        return DownloadStatus.FailedDownload, None
+
     message = await fetch_message(client, message)
-    
+
     logger.debug(f"开始下载消息 {message.id}...")
-    
+
     try:
         for _type in media_types:
             _media = getattr(message, _type, None)
@@ -826,13 +877,13 @@ async def download_media(
                 node.chat_id, message, _media, _type
             )
             media_size = getattr(_media, "file_size", 0)
-            
+
             ui_file_name = file_name
             if app.hide_file_name:
                 ui_file_name = f"****{os.path.splitext(file_name)[-1]}"
-            
+
             logger.debug(f"消息 {message.id}: 类型={_type}, 大小={media_size} bytes, 格式={file_format}")
-            
+
             if _can_download(_type, file_formats, file_format):
                 if _is_exist(file_name):
                     file_size = os.path.getsize(file_name)
@@ -845,7 +896,7 @@ async def download_media(
             else:
                 logger.info(f"消息 {message.id}: 文件格式 {file_format} 不在允许的下载列表中，跳过")
                 return DownloadStatus.SkipDownload, None
-            
+
             break
     except Exception as e:
         logger.error(
@@ -854,18 +905,30 @@ async def download_media(
             exc_info=True,
         )
         return DownloadStatus.FailedDownload, None
-    
+
     if _media is None:
         logger.debug(f"消息 {message.id}: 没有媒体内容，跳过")
         return DownloadStatus.SkipDownload, None
-    
+
     message_id = message.id
-    
+
     for retry in range(3):
         try:
+            # 检查是否要退出
+            if getattr(app, 'force_exit', False):
+                logger.debug(f"消息 {message.id}: 程序正在退出，中止下载")
+                # 清理临时文件
+                if temp_file_name and os.path.exists(temp_file_name):
+                    try:
+                        os.remove(temp_file_name)
+                        logger.debug(f"已删除临时文件: {temp_file_name}")
+                    except:
+                        pass
+                return DownloadStatus.FailedDownload, None
+
             if retry > 0:
                 logger.warning(f"消息 {message.id}: 第 {retry} 次重试下载")
-            
+
             temp_download_path = await client.download_media(
                 message,
                 file_name=temp_file_name,
@@ -878,20 +941,31 @@ async def download_media(
                     client,
                 ),
             )
-            
+
             if temp_download_path and isinstance(temp_download_path, str):
                 _check_download_finish(media_size, temp_download_path, ui_file_name)
                 await asyncio.sleep(0.5)
                 _move_to_download_path(temp_download_path, file_name)
-                
+
                 logger.success(f"消息 {message.id}: 下载成功 - {ui_file_name}")
                 return DownloadStatus.SuccessDownload, file_name
+
         except OSError as e:
             logger.warning(f"网络连接错误: {e}，重试 {retry + 1}/3")
             await asyncio.sleep(RETRY_TIME_OUT * (retry + 1))
             if retry == 2:
                 await record_failed_task(node.chat_id, message.id, f"Network error: {str(e)}")
                 raise
+        except asyncio.CancelledError:
+            logger.info(f"消息 {message.id} 下载被取消")
+            # 清理临时文件
+            if temp_file_name and os.path.exists(temp_file_name):
+                try:
+                    os.remove(temp_file_name)
+                    logger.debug(f"已删除临时文件: {temp_file_name}")
+                except:
+                    pass
+            raise  # 重新抛出，让worker处理
         except pyrogram.errors.exceptions.bad_request_400.BadRequest:
             logger.warning(
                 f"Message[{message.id}]: {_t('file reference expired, refetching')}..."
@@ -924,7 +998,7 @@ async def download_media(
                 exc_info=True,
             )
             break
-    
+
     logger.error(f"消息 {message.id}: 下载失败，已加入失败任务列表")
     return DownloadStatus.FailedDownload, None
 
@@ -939,12 +1013,42 @@ def _check_config() -> bool:
     print_meta(logger)
     try:
         _load_config()
+
+        # 移除loguru的默认处理器
+        logger.remove()
+
+        # 根据配置设置日志级别
+        log_level = app.log_level.upper() if hasattr(app, 'log_level') else "INFO"
+
+        # 添加控制台处理器
+        logger.add(
+            sys.stderr,
+            level=log_level,
+            format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+            colorize=True,
+            backtrace=False,
+            diagnose=False
+        )
+
+        # 添加文件处理器
         logger.add(
             os.path.join(app.log_file_path, "tdl.log"),
             rotation="10 MB",
             retention="10 days",
-            level=app.log_level,
+            level=log_level,
+            format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
+            backtrace=False,
+            diagnose=False
         )
+
+        # 设置DEBUG环境变量
+        if log_level == "DEBUG":
+            os.environ["DEBUG"] = "1"
+            logging.getLogger().setLevel(logging.DEBUG)
+        else:
+            os.environ.pop("DEBUG", None)
+            logging.getLogger().setLevel(logging.INFO)
+
         return True
     except Exception as e:
         logger.exception(f"load config error: {e}")
@@ -954,25 +1058,31 @@ def _check_config() -> bool:
 async def download_worker(client: pyrogram.client.Client, worker_id: int):
     """下载任务worker"""
     logger.debug(f"下载Worker {worker_id} 启动")
-    
-    while getattr(app, 'is_running', True) and not getattr(app, 'force_exit', False):
+
+    while getattr(app, 'is_running', True):
+        # 检查是否要强制退出
+        if getattr(app, 'force_exit', False):
+            logger.debug(f"下载Worker {worker_id} 收到退出信号，准备退出")
+            break
+
         try:
             # 检查磁盘空间
             bark_config = getattr(app, 'bark_notification', {})
             threshold_gb = bark_config.get('disk_space_threshold_gb', 10.0)
-            
+
             has_space, available_gb, _ = await check_disk_space(threshold_gb)
-            
+
             if not has_space:
                 if worker_id not in disk_monitor.paused_workers:
-                    logger.warning(f"下载Worker {worker_id}: 磁盘空间不足 ({available_gb}GB < {threshold_gb}GB)，暂停下载")
+                    logger.warning(
+                        f"下载Worker {worker_id}: 磁盘空间不足 ({available_gb}GB < {threshold_gb}GB)，暂停下载")
                     disk_monitor.paused_workers.add(worker_id)
-                    
+
                     events_to_notify = bark_config.get('events_to_notify', [])
                     if 'task_paused' in events_to_notify:
                         message = f"Worker {worker_id}: 因磁盘空间不足暂停下载\n可用空间: {available_gb}GB"
                         await send_bark_notification("下载任务暂停", message)
-                
+
                 await asyncio.sleep(60)
                 continue
             else:
@@ -983,53 +1093,59 @@ async def download_worker(client: pyrogram.client.Client, worker_id: int):
             logger.error(f"下载Worker {worker_id} 检查磁盘空间时异常: {e}")
             await asyncio.sleep(60)
             continue
-        
+
         try:
+            # 使用带超时的get，避免阻塞
             try:
-                item = await asyncio.wait_for(download_queue.get(), timeout=1.0)
+                message, node = await asyncio.wait_for(download_queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
-                if getattr(app, 'force_exit', False):
-                    logger.debug(f"下载Worker {worker_id} 收到退出信号")
-                    break
                 continue
-            
-            message = item[0]
-            node: TaskNode = item[1]
-            
-            if node.is_stop_transmission or getattr(app, 'force_exit', False):
+
+            # 再次检查是否要退出
+            if getattr(app, 'force_exit', False):
+                logger.debug(f"下载Worker {worker_id} 收到退出信号，将任务放回队列")
+                await download_queue.put((message, node))  # 放回队列
+                download_queue.task_done()  # 标记当前任务为完成
+                break
+
+            if node.is_stop_transmission:
                 download_queue.task_done()
                 continue
-            
+
             logger.debug(f"下载Worker {worker_id} 开始处理消息 {message.id} (聊天: {node.chat_id})")
-            
+
             try:
                 if node.client:
                     await download_task(node.client, message, node)
                 else:
                     await download_task(client, message, node)
-                
+
                 logger.debug(f"下载Worker {worker_id} 完成处理消息 {message.id}")
+            except asyncio.CancelledError:
+                logger.info(f"下载Worker {worker_id} 被取消，将消息 {message.id} 放回队列")
+                await download_queue.put((message, node))  # 放回队列
+                raise  # 重新抛出异常
             except OSError as e:
                 logger.error(f"下载Worker {worker_id}: 消息 {message.id} 网络连接错误: {e}")
-                await download_queue.put(item)
+                await record_failed_task(node.chat_id, message.id, str(e))
+                node.download_status[message.id] = DownloadStatus.FailedDownload
+                # 将失败任务重新放入队列，等待重试
                 await asyncio.sleep(10)
-                download_queue.task_done()
-                continue
+                await download_queue.put((message, node))
             except Exception as e:
                 logger.error(f"下载Worker {worker_id}: 消息 {message.id} 下载任务异常: {e}")
                 await record_failed_task(node.chat_id, message.id, str(e))
                 node.download_status[message.id] = DownloadStatus.FailedDownload
+            finally:
                 download_queue.task_done()
-            else:
-                download_queue.task_done()
-        
+
         except asyncio.CancelledError:
-            logger.debug(f"下载Worker {worker_id} 任务被取消")
+            logger.debug(f"下载Worker {worker_id} 被取消")
             break
         except Exception as e:
             logger.error(f"下载Worker {worker_id} 异常: {e}")
             await asyncio.sleep(1)
-    
+
     logger.debug(f"下载Worker {worker_id} 退出")
 
 
@@ -1423,17 +1539,12 @@ def check_config_consistency(app):
 def main():
     """主函数"""
     setup_exit_signal_handlers()
-    
-    logger.info("=" * 60)
-    logger.info("Telegram Media Downloader 启动")
-    logger.info(f"启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info("=" * 60)
-    
+
     tasks = []
     notify_tasks = []
     download_tasks = []
     monitor_tasks = []
-    
+
     client = HookClient(
         "media_downloader",
         api_id=app.api_id,
@@ -1442,7 +1553,7 @@ def main():
         workdir=app.session_file_path,
         start_timeout=app.start_timeout,
     )
-    
+
     try:
         app.pre_run()
         init_web(app)
@@ -1544,78 +1655,58 @@ def main():
         
         app.loop.set_exception_handler(global_exception_handler)
         set_max_concurrent_transmissions(client, app.max_concurrent_transmissions)
-        
+
         app.loop.run_until_complete(start_server(client))
         logger.success(_t("Successfully started (Press Ctrl+C to stop)"))
-        
+
         # 设置运行标志
         if not hasattr(app, 'force_exit'):
             app.force_exit = False
         if not hasattr(app, 'is_running'):
             app.is_running = True
-        
-        # 启动前的配置状态
-        logger.info("=" * 40)
-        logger.info("启动前配置状态:")
-        logger.info(f"  下载worker数: {queue_manager.max_download_tasks}")
-        logger.info(f"  通知worker数: {queue_manager.max_notify_tasks}")
-        logger.info(f"  批量大小: {queue_manager.download_batch_size}")
-        logger.info(f"  聊天配置数: {len(app.chat_download_config)}")
-        logger.info("=" * 40)
-        
-        # 启动通知worker（先于下载worker启动）
+
+        # 启动所有worker
         notify_tasks = app.loop.run_until_complete(start_notify_workers())
-        
-        # 启动下载worker
         download_tasks = app.loop.run_until_complete(start_download_workers(client))
-        
+
         # 启动监控任务
         if hasattr(app, 'bark_notification') and app.bark_notification.get('enabled', False):
             disk_monitor_task_obj = app.loop.create_task(disk_space_monitor_task())
             monitor_tasks.append(disk_monitor_task_obj)
-            
+
             stats_task_obj = app.loop.create_task(stats_notification_task())
             monitor_tasks.append(stats_task_obj)
-            
+
             logger.info("磁盘空间监控和统计通知已启用")
         else:
             logger.info("Bark通知未启用，跳过监控任务")
-        
+
         # 发送启动通知
         if hasattr(app, 'bark_notification') and app.bark_notification.get('enabled', False):
             events_to_notify = app.bark_notification.get('events_to_notify', [])
             if 'startup' in events_to_notify:
                 startup_msg = (
                     f"✅ Telegram媒体下载器已启动\n"
-                    f"版本: 2.2.5\n"
                     f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                     f"下载worker: {queue_manager.max_download_tasks}\n"
-                    f"通知worker: {queue_manager.max_notify_tasks}\n"
                     f"配置聊天数: {len(app.chat_download_config)}"
                 )
                 app.loop.create_task(send_bark_notification("程序启动", startup_msg))
-        
+
         app.loop.create_task(download_all_chat(client))
-        
+
         if app.bot_token:
             app.loop.run_until_complete(
                 start_download_bot(app, client, add_download_task, download_chat_task)
             )
-        
+
         logger.info("=" * 60)
         logger.info("所有组件已启动，开始处理任务...")
         logger.info("=" * 60)
-        
+
         # 主运行循环
-        while getattr(app, 'is_running', True) and not getattr(app, 'force_exit', False):
-            try:
-                _exec_loop()
-            except KeyboardInterrupt:
-                logger.info(_t("KeyboardInterrupt"))
-                if hasattr(app, 'force_exit'):
-                    app.force_exit = True
-                break
-    
+        app.loop.run_until_complete(run_until_all_task_finish())
+
     except KeyboardInterrupt:
         logger.info(_t("KeyboardInterrupt"))
         if hasattr(app, 'force_exit'):
@@ -1623,67 +1714,47 @@ def main():
     except Exception as e:
         logger.exception("{}", e)
     finally:
-        # 发送关闭通知
-        if getattr(app, 'is_running', False) and hasattr(app, 'bark_notification') and app.bark_notification.get('enabled', False):
-            events_to_notify = app.bark_notification.get('events_to_notify', [])
-            if 'shutdown' in events_to_notify:
-                stats = collect_stats()
-                shutdown_msg = (
-                    f"🛑 Telegram媒体下载器已停止\n"
-                    f"运行时间: {stats.get('uptime', 'N/A')}\n"
-                    f"完成任务: {stats.get('tasks_completed', 0)}\n"
-                    f"失败任务: {stats.get('tasks_failed', 0)}\n"
-                    f"磁盘可用: {stats.get('disk_available_gb', 0):.2f}GB\n"
-                    f"下载队列剩余: {download_queue.qsize()}\n"
-                    f"通知队列剩余: {notify_queue.qsize()}\n"
-                    f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                )
-                app.loop.run_until_complete(send_bark_notification("程序停止", shutdown_msg))
-        
-        if hasattr(app, 'is_running'):
-            app.is_running = False
-        
+        # 执行优雅关闭
         logger.info("=" * 60)
         logger.info("程序正在停止...")
-        logger.info(f"当前下载队列剩余任务: {download_queue.qsize()}")
-        logger.info(f"当前通知队列剩余任务: {notify_queue.qsize()}")
-        logger.info("=" * 60)
-        
+
+        try:
+            app.loop.run_until_complete(graceful_shutdown())
+        except Exception as e:
+            logger.error(f"优雅关闭过程中出错: {e}")
+
         # 取消所有任务
-        for task in monitor_tasks:
-            task.cancel()
-        
-        for i, task in enumerate(download_tasks):
-            task.cancel()
-            logger.debug(f"取消下载Worker {i + 1}")
-        
-        for i, task in enumerate(notify_tasks):
-            task.cancel()
-            logger.debug(f"取消通知Worker {i + 1}")
-        
-        # 等待队列清空
-        app.loop.run_until_complete(wait_for_queues_to_empty())
-        
+        all_tasks = monitor_tasks + download_tasks + notify_tasks
+        for task in all_tasks:
+            if not task.done():
+                task.cancel()
+
+        # 等待一小段时间让任务响应取消
+        try:
+            app.loop.run_until_complete(asyncio.sleep(2))
+        except:
+            pass
+
         logger.info(f"{_t('update config')}......")
         try:
             app.update_config()
             logger.success(f"{_t('Updated last read message_id to config file')}")
         except Exception as e:
             logger.error(f"保存配置时出错: {e}")
-        
+
         if app.bot_token:
             try:
                 app.loop.run_until_complete(stop_download_bot())
             except:
                 pass
-        
+
         try:
             app.loop.run_until_complete(stop_server(client))
         except:
             pass
-        
+
         logger.info(_t("Stopped!"))
-        
+
         logger.info("=" * 60)
         logger.info("下载统计:")
         logger.success(
@@ -1693,16 +1764,6 @@ def main():
         )
         logger.info(f"队列管理器统计: 添加任务={queue_manager.task_added}, 处理任务={queue_manager.task_processed}")
         logger.info("=" * 60)
-        
-        try:
-            failed_tasks_file = os.path.join(app.session_file_path, "failed_tasks.json")
-            if os.path.exists(failed_tasks_file):
-                with open(failed_tasks_file, 'r', encoding='utf-8') as f:
-                    failed_tasks = json.load(f)
-                total_failed = sum(len(tasks) for tasks in failed_tasks.values())
-                logger.info(f"当前失败任务数: {total_failed}")
-        except:
-            pass
 
 
 if __name__ == "__main__":
