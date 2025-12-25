@@ -339,11 +339,11 @@ def get_config(config, key, default=None, val_type=str, verbose=True):
 
 class ConfigSchema:
     """配置架构定义，描述每个配置项的默认值、类型和转换函数"""
-    
+
     # 基础配置架构
     BASE_CONFIG = {
         # 键名: (默认值, 类型, 转换函数或None)
-        "api_id": ("", str, None),
+        "api_id": (0, int, None),
         "api_hash": ("", str, None),
         "bot_token": ("", str, None),
         "save_path": (os.path.join(os.path.abspath("."), "downloads"), str, None),
@@ -372,37 +372,75 @@ class ConfigSchema:
         "date_format": ("%Y_%m", str, None),
         "drop_no_audio_video": (False, bool, None),
         "enable_download_txt": (False, bool, None),
-        "bark_notification": ({
-            'enabled': False,
-            'url': '',
-            'disk_space_threshold_gb': 10.0,
-            'space_check_interval': 300,
-            'stats_notification_interval': 3600,
-            'notify_worker_count': 1,
-            'events_to_notify': []
-        }, dict, None),
         "forward_limit": (33, int, None),
     }
-    
+
+    # 新增：通知配置架构
+    NOTIFICATION_CONFIG = {
+        # 键名: (默认值, 类型, 转换函数或None)
+        "notifications": ({
+                              # Bark 配置
+                              "bark": {
+                                  "enabled": False,
+                                  "url": "",
+                                  "default_group": "TelegramDownloader",
+                                  "default_level": "active",
+                                  "events_to_notify": [],
+                                  "disk_space_threshold_gb": 10.0,
+                                  "space_check_interval": 300,
+                                  "stats_notification_interval": 3600,
+                                  "notify_worker_count": 1
+                              },
+                              # 群晖 Chat 配置
+                              "synology_chat": {
+                                  "enabled": False,
+                                  "webhook_url": "",
+                                  "bot_name": "Telegram下载器",
+                                  "bot_avatar": "https://telegram.org/img/t_logo.png",
+                                  "default_level": "info",
+                                  "events_to_notify": [],
+                                  "mention_users": [],
+                                  "mention_channels": [],
+                                  "disk_space_threshold_gb": 10.0,
+                                  "space_check_interval": 300
+                              },
+                              # 全局配置
+                              "global": {
+                                  "stats_notification_interval": 3600,
+                                  "queue_monitor_interval": 300,
+                                  "max_notification_retries": 3,
+                                  "default_timeout": 15
+                              }
+                          }, dict, None),
+    }
+
+    @classmethod
+    def get_all_configs(cls):
+        """获取所有配置项"""
+        return {**cls.BASE_CONFIG, **cls.NOTIFICATION_CONFIG}
+
     @classmethod
     def get_default(cls, key):
         """获取配置项的默认值"""
-        if key in cls.BASE_CONFIG:
-            return cls.BASE_CONFIG[key][0]
+        all_configs = cls.get_all_configs()
+        if key in all_configs:
+            return all_configs[key][0]
         return None
-    
+
     @classmethod
     def get_type(cls, key):
         """获取配置项的类型"""
-        if key in cls.BASE_CONFIG:
-            return cls.BASE_CONFIG[key][1]
+        all_configs = cls.get_all_configs()
+        if key in all_configs:
+            return all_configs[key][1]
         return type(None)
-    
+
     @classmethod
     def get_converter(cls, key):
         """获取配置项的转换函数"""
-        if key in cls.BASE_CONFIG:
-            return cls.BASE_CONFIG[key][2]
+        all_configs = cls.get_all_configs()
+        if key in all_configs:
+            return all_configs[key][2]
         return None
 
 
@@ -410,10 +448,10 @@ class Application:
     """Application load config and update config."""
 
     def __init__(
-        self,
-        config_file: str,
-        app_data_file: str,
-        application_name: str = "UndefineApp",
+            self,
+            config_file: str,
+            app_data_file: str,
+            application_name: str = "UndefineApp",
     ):
         """
         Init and update telegram media downloader config
@@ -443,10 +481,10 @@ class Application:
         self.cloud_drive_config = CloudDriveConfig()
         self.caption_name_dict: dict = {}
         self.caption_entities_dict: dict = {}
-        
+
         # 使用配置架构初始化所有配置项
         self._init_config_from_schema()
-        
+
         self.forward_limit_call = LimitCall(max_limit_call_times=self.forward_limit)
 
         self.loop = asyncio.new_event_loop()
@@ -458,43 +496,55 @@ class Application:
 
     def _init_config_from_schema(self):
         """根据配置架构初始化所有配置项"""
-        for key, (default_value, value_type, converter) in ConfigSchema.BASE_CONFIG.items():
+        for key, (default_value, value_type, converter) in ConfigSchema.get_all_configs().items():
             setattr(self, key, default_value)
-    
+
     def _load_and_convert_value(self, key: str, raw_value: Any) -> Any:
         """加载并转换配置值"""
         try:
             converter = ConfigSchema.get_converter(key)
             expected_type = ConfigSchema.get_type(key)
-            
+
             if converter:
                 # 使用转换函数
                 converted_value = converter(raw_value)
             else:
                 # 直接赋值，但检查类型
                 converted_value = raw_value
-            
-            # 类型检查
+
+            # 类型检查 - 更灵活的处理
             if expected_type and not isinstance(converted_value, expected_type):
-                logger.warning(f"配置项 {key} 的类型不符合预期: "
-                             f"期望 {expected_type.__name__}, 实际 {type(converted_value).__name__}")
-                # 尝试类型转换
+                # 尝试自动类型转换
                 try:
                     if expected_type == bool:
-                        converted_value = str(converted_value).lower() in ('true', '1', 'yes', 'on')
+                        if isinstance(converted_value, str):
+                            converted_value = converted_value.lower() in ('true', '1', 'yes', 'on', 't', 'y')
+                        elif isinstance(converted_value, int):
+                            converted_value = bool(converted_value)
+                    elif expected_type == int:
+                        converted_value = int(converted_value)
+                    elif expected_type == float:
+                        converted_value = float(converted_value)
+                    elif expected_type == str:
+                        converted_value = str(converted_value)
+                    elif expected_type == list and isinstance(converted_value, (tuple, set)):
+                        converted_value = list(converted_value)
                     else:
-                        converted_value = expected_type(converted_value)
-                except (ValueError, TypeError):
+                        # 转换失败，使用默认值
+                        default_value = ConfigSchema.get_default(key)
+                        logger.warning(f"配置项 {key} 类型转换失败，使用默认值: {default_value}")
+                        converted_value = default_value
+                except (ValueError, TypeError) as e:
                     # 转换失败，使用默认值
                     default_value = ConfigSchema.get_default(key)
-                    logger.warning(f"配置项 {key} 类型转换失败，使用默认值: {default_value}")
+                    logger.warning(f"配置项 {key} 类型转换失败 ({e})，使用默认值: {default_value}")
                     converted_value = default_value
-            
+
             return converted_value
         except Exception as e:
             logger.error(f"处理配置项 {key} 时出错: {e}")
             return ConfigSchema.get_default(key)
-    
+
     def assign_config(self, _config: dict) -> bool:
         """assign config from str.
 
@@ -509,36 +559,64 @@ class Application:
         """
         # 处理特殊配置项（需要复杂逻辑的）
         self._process_special_configs(_config)
-        
+
+        # 处理通知配置（必须放在通用配置之前，因为它会修改 _config）
+        self._process_notifications_config(_config)
+
         # 处理通用配置项
         self._process_general_configs(_config)
-        
+
         # 处理聊天配置
         self._process_chat_configs(_config)
-        
+
         # 处理云存储配置
         self._process_cloud_drive_config(_config)
-        
+
         # 处理日期格式
         self._validate_date_format()
-        
+
         # 处理聊天配置的过滤器
         self._process_chat_filters()
-        
+
+        # 处理log_level
+        if 'log_level' in _config:
+            log_level = _config['log_level'].upper()
+            # 设置loguru的日志级别
+            try:
+                import sys
+                import loguru
+                # 移除现有处理器
+                logger.remove()
+                # 重新添加处理器
+                logger.add(
+                    sys.stderr,
+                    level=log_level,
+                    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
+                )
+                # 添加文件日志
+                logger.add(
+                    os.path.join(self.log_file_path, "tdl.log"),
+                    rotation="10 MB",
+                    retention="10 days",
+                    level=log_level,
+                )
+            except Exception as e:
+                logger.error(f"设置日志级别失败: {e}")
+
         return True
-    
+
     def _process_special_configs(self, _config: dict):
         """处理需要特殊逻辑的配置项"""
         # 从配置中提取特殊的配置项并设置
         if "save_path" in _config:
             self.save_path = _config["save_path"]
-        
+
         # 媒体类型和文件格式是必须的
         if "media_types" in _config:
             self.media_types = _config["media_types"]
         if "file_formats" in _config:
             self.file_formats = _config["file_formats"]
-    
+
     def _process_general_configs(self, _config: dict):
         """处理通用配置项"""
         # 遍历配置架构中的所有键
@@ -547,14 +625,14 @@ class Application:
                 raw_value = _config[key]
                 converted_value = self._load_and_convert_value(key, raw_value)
                 setattr(self, key, converted_value)
-                
+
                 # 记录日志（可选）
                 if key in ['api_id', 'api_hash', 'bot_token', 'web_login_secret']:
                     masked_value = '****' if raw_value else ''
                     logger.debug(f"加载配置 {key}: {masked_value}")
                 else:
                     logger.debug(f"加载配置 {key}: {raw_value}")
-    
+
     def _process_chat_configs(self, _config: dict):
         """处理聊天配置"""
         if "chat" in _config:
@@ -608,7 +686,7 @@ class Application:
                 self.config["chat"][0]["download_filter"] = download_filter_dict[
                     self._chat_id
                 ]
-    
+
     def _process_cloud_drive_config(self, _config: dict):
         """处理云存储配置"""
         if "upload_drive" in _config:
@@ -638,7 +716,7 @@ class Application:
                 self.cloud_drive_config.upload_adapter = upload_drive_config[
                     "upload_adapter"
                 ]
-    
+
     def _validate_date_format(self):
         """验证日期格式"""
         try:
@@ -647,7 +725,7 @@ class Application:
         except Exception as e:
             logger.warning(f"配置日期格式错误: {e}")
             self.date_format = "%Y_%m"
-    
+
     def _process_chat_filters(self):
         """处理聊天过滤器"""
         for key, value in self.chat_download_config.items():
@@ -837,77 +915,120 @@ class Application:
         return True
 
     # pylint: disable = R0912
+    # 在 app.py 中修改 Application 类的 update_config 方法
     def update_config(self, immediate: bool = True):
-        """update config
-
-        Parameters
-        ----------
-        immediate: bool
-            If update config immediate,default True
-        """
-        # TODO: fix this not exist chat
+        """更新配置 - 重构版本"""
+        # 确保 app_data 中有 chat 配置
         if not self.app_data.get("chat") and self.config.get("chat"):
             self.app_data["chat"] = [
                 {"chat_id": i} for i in range(0, len(self.config["chat"]))
             ]
-        idx = 0
-        # pylint: disable = R1733
-        for key, value in self.chat_download_config.items():
-            # pylint: disable = W0201
-            unfinished_ids = set(value.ids_to_retry)
 
-            for it in value.ids_to_retry:
-                if  value.node.download_status.get(
-                    it, DownloadStatus.FailedDownload
-                ) in [DownloadStatus.SuccessDownload, DownloadStatus.SkipDownload]:
-                    unfinished_ids.remove(it)
+        # 创建 chat_id 到索引的映射
+        chat_id_to_idx = {}
+        for idx, chat_item in enumerate(self.config.get("chat", [])):
+            chat_id = chat_item.get("chat_id")
+            if chat_id:
+                chat_id_to_idx[chat_id] = idx
 
-            for _idx, _value in value.node.download_status.items():
-                if DownloadStatus.SuccessDownload != _value and DownloadStatus.SkipDownload != _value:
-                    unfinished_ids.add(_idx)
+        # 遍历聊天配置，更新状态
+        for chat_id, chat_config in self.chat_download_config.items():
+            # 找到对应的索引
+            idx = chat_id_to_idx.get(chat_id, -1)
 
-            self.chat_download_config[key].ids_to_retry = list(unfinished_ids)
+            # 如果不存在于原始配置中，跳过（临时任务不应该保存到配置）
+            if idx == -1:
+                continue
 
-            if idx >= len(self.app_data["chat"]):
+            # 收集失败任务ID
+            unfinished_ids = set()
+
+            # 1. 从已有的失败任务开始
+            for task_id in chat_config.ids_to_retry:
+                unfinished_ids.add(task_id)
+
+            # 2. 检查当前节点状态，只添加确实失败的任务
+            if chat_config.node and chat_config.node.download_status:
+                for task_id, status in chat_config.node.download_status.items():
+                    if status in [DownloadStatus.FailedDownload, DownloadStatus.Downloading]:
+                        # 只有确实失败的任务才添加到重试列表
+                        unfinished_ids.add(task_id)
+                        logger.debug(f"任务 {task_id} 状态为 {status}，添加到重试列表")
+
+            # 3. 检查失败任务文件中的任务
+            try:
+                failed_tasks_file = os.path.join(self.session_file_path, "failed_tasks.json")
+                if os.path.exists(failed_tasks_file):
+                    with open(failed_tasks_file, 'r', encoding='utf-8') as f:
+                        all_failed_tasks = json.load(f)
+
+                    chat_key = str(chat_id)
+                    if chat_key in all_failed_tasks:
+                        for task in all_failed_tasks[chat_key]:
+                            unfinished_ids.add(task['message_id'])
+            except Exception as e:
+                logger.error(f"读取失败任务文件失败: {e}")
+
+            # 更新配置中的失败任务列表
+            chat_config.ids_to_retry = list(unfinished_ids)
+
+            # 确保 app_data 有足够的项目
+            while idx >= len(self.app_data["chat"]):
                 self.app_data["chat"].append({})
 
-            if value.finish_task:
-                self.config["chat"][idx]["last_read_message_id"] = (
-                    value.last_read_message_id + 1
-                )
+            # 只更新 last_read_message_id 如果确实有完成任务
+            if chat_config.finish_task > 0 and chat_config.last_read_message_id > 0:
+                # 确保新的 last_read_message_id 比原来的大
+                current_last_id = self.config["chat"][idx].get("last_read_message_id", 0)
+                new_last_id = max(current_last_id, chat_config.last_read_message_id + 1)
+                self.config["chat"][idx]["last_read_message_id"] = new_last_id
+                logger.debug(f"更新聊天 {chat_id} 的 last_read_message_id: {new_last_id}")
 
-            self.app_data["chat"][idx]["chat_id"] = key
-            self.app_data["chat"][idx]["ids_to_retry"] = value.ids_to_retry
-            idx += 1
+            # 更新 app_data
+            self.app_data["chat"][idx]["chat_id"] = chat_id
+            self.app_data["chat"][idx]["ids_to_retry"] = chat_config.ids_to_retry
 
+        # 更新其他配置项
         self.config["save_path"] = self.save_path
         self.config["file_path_prefix"] = self.file_path_prefix
 
-        if self.config.get("ids_to_retry"):
-            self.config.pop("ids_to_retry")
+        # 清理旧版配置项
+        old_keys = ["ids_to_retry", "chat_id", "download_filter", "last_read_message_id"]
+        for key in old_keys:
+            if key in self.config:
+                self.config.pop(key)
 
-        if self.config.get("chat_id"):
-            self.config.pop("chat_id")
-
-        if self.config.get("download_filter"):
-            self.config.pop("download_filter")
-
-        if self.config.get("last_read_message_id"):
-            self.config.pop("last_read_message_id")
-
+        # 更新语言配置
         self.config["language"] = self.language.name
-        # for it in self.downloaded_ids:
-        #    self.already_download_ids_set.add(it)
 
-        # self.app_data["already_download_ids"] = list(self.already_download_ids_set)
-
+        # 立即写入配置
         if immediate:
-            with open(self.config_file, "w", encoding="utf-8") as yaml_file:
-                _yaml.dump(self.config, yaml_file)
+            try:
+                # 备份原始配置以防万一
+                config_backup = f"{self.config_file}.backup.{int(time.time())}"
+                if os.path.exists(self.config_file):
+                    shutil.copy2(self.config_file, config_backup)
+                    logger.info(f"已备份配置到: {config_backup}")
 
-        if immediate:
-            with open(self.app_data_file, "w", encoding='utf-8') as yaml_file:
-                _yaml.dump(self.app_data, yaml_file)
+                # 写入新配置
+                with open(self.config_file, "w", encoding="utf-8") as yaml_file:
+                    _yaml.dump(self.config, yaml_file)
+                logger.info("配置更新成功")
+
+                # 写入应用数据
+                with open(self.app_data_file, "w", encoding='utf-8') as yaml_file:
+                    _yaml.dump(self.app_data, yaml_file)
+                logger.info("应用数据更新成功")
+
+            except Exception as e:
+                logger.error(f"写入配置失败: {e}")
+                # 尝试恢复备份
+                if os.path.exists(config_backup):
+                    try:
+                        shutil.copy2(config_backup, self.config_file)
+                        logger.info("已从备份恢复配置")
+                    except Exception as restore_error:
+                        logger.error(f"恢复配置失败: {restore_error}")
 
     def set_language(self, language: Language):
         """Set Language"""
@@ -1029,3 +1150,109 @@ class Application:
         self.chat_download_config[node.chat_id].last_read_message_id = max(
             self.chat_download_config[node.chat_id].last_read_message_id, message_id
         )
+
+    def _process_notifications_config(self, _config: dict):
+        """处理通知配置，支持旧版和新版配置"""
+        # 先检查是否有旧版的 bark_notification 配置
+        if "bark_notification" in _config:
+            bark_config = _config["bark_notification"]
+            logger.info("检测到旧版 Bark 配置，正在转换为新版格式...")
+
+            # 构建新的 notifications 配置
+            new_notifications = {
+                "bark": {
+                    "enabled": bark_config.get("enabled", False),
+                    "url": bark_config.get("url", ""),
+                    "default_group": bark_config.get("default_group", "TelegramDownloader"),
+                    "default_level": bark_config.get("default_level", "active"),
+                    "events_to_notify": bark_config.get("events_to_notify", []),
+                    "disk_space_threshold_gb": bark_config.get("disk_space_threshold_gb", 10.0),
+                    "space_check_interval": bark_config.get("space_check_interval", 300),
+                    "stats_notification_interval": bark_config.get("stats_notification_interval", 3600),
+                    "notify_worker_count": bark_config.get("notify_worker_count", 1)
+                },
+                "synology_chat": {
+                    "enabled": False,
+                    "webhook_url": "",
+                    "bot_name": "Telegram下载器",
+                    "default_level": "info",
+                    "events_to_notify": [],
+                    "disk_space_threshold_gb": 10.0,
+                    "space_check_interval": 300
+                },
+                "global": {
+                    "stats_notification_interval": bark_config.get("stats_notification_interval", 3600),
+                    "queue_monitor_interval": 300,
+                    "max_notification_retries": 3,
+                    "default_timeout": 15
+                }
+            }
+
+            # 将新配置合并到现有配置
+            if "notifications" not in _config:
+                _config["notifications"] = new_notifications
+            else:
+                # 合并配置，新版配置优先
+                existing = _config["notifications"]
+                if "bark" not in existing:
+                    existing["bark"] = new_notifications["bark"]
+                else:
+                    # 合并 Bark 配置，新版优先
+                    for key, value in new_notifications["bark"].items():
+                        if key not in existing["bark"]:
+                            existing["bark"][key] = value
+
+                # 确保其他配置也存在
+                if "synology_chat" not in existing:
+                    existing["synology_chat"] = new_notifications["synology_chat"]
+                if "global" not in existing:
+                    existing["global"] = new_notifications["global"]
+
+            # 从配置中移除旧版配置
+            _config.pop("bark_notification")
+            logger.info("已将旧版 Bark 配置转换为新版 notifications 格式")
+
+        # 处理新版 notifications 配置
+        if "notifications" in _config:
+            notifications_config = _config["notifications"]
+
+            # 确保所有必需的子配置都存在
+            if "bark" not in notifications_config:
+                notifications_config["bark"] = {
+                    "enabled": False,
+                    "url": "",
+                    "default_group": "TelegramDownloader",
+                    "default_level": "active",
+                    "events_to_notify": []
+                }
+
+            if "synology_chat" not in notifications_config:
+                notifications_config["synology_chat"] = {
+                    "enabled": False,
+                    "webhook_url": "",
+                    "bot_name": "Telegram下载器",
+                    "default_level": "info",
+                    "events_to_notify": []
+                }
+
+            if "global" not in notifications_config:
+                notifications_config["global"] = {
+                    "stats_notification_interval": 3600,
+                    "queue_monitor_interval": 300,
+                    "max_notification_retries": 3,
+                    "default_timeout": 15
+                }
+
+            # 设置到实例属性
+            self.notifications = notifications_config
+
+            # 为了向后兼容，也设置 bark_notification 属性
+            self.bark_notification = notifications_config.get("bark", {})
+
+            logger.debug(f"已加载通知配置: Bark={notifications_config['bark'].get('enabled', False)}, "
+                         f"SynologyChat={notifications_config['synology_chat'].get('enabled', False)}")
+        else:
+            # 如果没有 notifications 配置，使用默认值
+            self.notifications = ConfigSchema.get_default("notifications")
+            self.bark_notification = self.notifications.get("bark", {})
+            logger.debug("使用默认通知配置")
