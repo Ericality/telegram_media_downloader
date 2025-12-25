@@ -1372,32 +1372,42 @@ def main():
         else:
             logger.success("配置检查通过!")
         
+        # 在main函数中，找到错误的那一行（大约第1376行），修改如下：
+
         # 详细调试信息
-        if logger.level <= logging.DEBUG:
-            logger.debug("=" * 40)
-            logger.debug("详细配置信息:")
+        # 修复：loguru的logger.level是一个方法，不能直接比较
+        try:
+            # 获取当前logger的级别值
+            current_level = logger._core.min_level  # loguru的内部属性，但这是获取当前最小级别的有效方法
+            logger.debug(f"当前日志级别值: {current_level}")
             
-            # 列出app对象的所有属性
-            logger.debug("App对象属性列表:")
-            for attr_name in dir(app):
-                if not attr_name.startswith('_'):  # 不显示私有属性
-                    try:
-                        attr_value = getattr(app, attr_name)
-                        # 只显示简单类型的属性
-                        if not callable(attr_value):  # 排除方法
-                            logger.debug(f"  {attr_name}: {type(attr_value).__name__}")
-                    except:
-                        pass
-            
-            # 检查config字典内容
-            if hasattr(app, 'config') and app.config:
-                logger.debug("\nConfig字典内容:")
-                for key, value in app.config.items():
-                    if key not in ['api_id', 'api_hash', 'bot_token', 'web_login_secret']:  # 排除敏感信息
-                        logger.debug(f"  {key}: {value}")
-                    else:
-                        logger.debug(f"  {key}: [敏感信息已隐藏]")
-            logger.debug("=" * 40)
+            if current_level <= 10:  # 10对应DEBUG级别
+                logger.debug("=" * 40)
+                logger.debug("详细配置信息:")
+                
+                # 列出app对象的所有属性
+                logger.debug("App对象属性列表:")
+                for attr_name in dir(app):
+                    if not attr_name.startswith('_'):  # 不显示私有属性
+                        try:
+                            attr_value = getattr(app, attr_name)
+                            # 只显示简单类型的属性
+                            if not callable(attr_value):  # 排除方法
+                                logger.debug(f"  {attr_name}: {type(attr_value).__name__}")
+                        except:
+                            pass
+                
+                # 检查config字典内容
+                if hasattr(app, 'config') and app.config:
+                    logger.debug("\nConfig字典内容:")
+                    for key, value in app.config.items():
+                        if key not in ['api_id', 'api_hash', 'bot_token', 'web_login_secret']:  # 排除敏感信息
+                            logger.debug(f"  {key}: {value}")
+                        else:
+                            logger.debug(f"  {key}: [敏感信息已隐藏]")
+                logger.debug("=" * 40)
+        except Exception as e:
+            logger.warning(f"无法获取详细调试信息: {e}")
         
         # 检查Bark配置加载情况
         if hasattr(app, 'bark_notification'):
