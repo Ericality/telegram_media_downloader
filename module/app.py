@@ -343,7 +343,7 @@ class ConfigSchema:
     # 基础配置架构
     BASE_CONFIG = {
         # 键名: (默认值, 类型, 转换函数或None)
-        "api_id": ("", str, None),
+        "api_id": (0, int, None),
         "api_hash": ("", str, None),
         "bot_token": ("", str, None),
         "save_path": (os.path.join(os.path.abspath("."), "downloads"), str, None),
@@ -460,36 +460,48 @@ class Application:
         """根据配置架构初始化所有配置项"""
         for key, (default_value, value_type, converter) in ConfigSchema.BASE_CONFIG.items():
             setattr(self, key, default_value)
-    
+
     def _load_and_convert_value(self, key: str, raw_value: Any) -> Any:
         """加载并转换配置值"""
         try:
             converter = ConfigSchema.get_converter(key)
             expected_type = ConfigSchema.get_type(key)
-            
+
             if converter:
                 # 使用转换函数
                 converted_value = converter(raw_value)
             else:
                 # 直接赋值，但检查类型
                 converted_value = raw_value
-            
-            # 类型检查
+
+            # 类型检查 - 更灵活的处理
             if expected_type and not isinstance(converted_value, expected_type):
-                logger.warning(f"配置项 {key} 的类型不符合预期: "
-                             f"期望 {expected_type.__name__}, 实际 {type(converted_value).__name__}")
-                # 尝试类型转换
+                # 尝试自动类型转换
                 try:
                     if expected_type == bool:
-                        converted_value = str(converted_value).lower() in ('true', '1', 'yes', 'on')
+                        if isinstance(converted_value, str):
+                            converted_value = converted_value.lower() in ('true', '1', 'yes', 'on', 't', 'y')
+                        elif isinstance(converted_value, int):
+                            converted_value = bool(converted_value)
+                    elif expected_type == int:
+                        converted_value = int(converted_value)
+                    elif expected_type == float:
+                        converted_value = float(converted_value)
+                    elif expected_type == str:
+                        converted_value = str(converted_value)
+                    elif expected_type == list and isinstance(converted_value, (tuple, set)):
+                        converted_value = list(converted_value)
                     else:
-                        converted_value = expected_type(converted_value)
-                except (ValueError, TypeError):
+                        # 转换失败，使用默认值
+                        default_value = ConfigSchema.get_default(key)
+                        logger.warning(f"配置项 {key} 类型转换失败，使用默认值: {default_value}")
+                        converted_value = default_value
+                except (ValueError, TypeError) as e:
                     # 转换失败，使用默认值
                     default_value = ConfigSchema.get_default(key)
-                    logger.warning(f"配置项 {key} 类型转换失败，使用默认值: {default_value}")
+                    logger.warning(f"配置项 {key} 类型转换失败 ({e})，使用默认值: {default_value}")
                     converted_value = default_value
-            
+
             return converted_value
         except Exception as e:
             logger.error(f"处理配置项 {key} 时出错: {e}")
@@ -524,6 +536,30 @@ class Application:
         
         # 处理聊天配置的过滤器
         self._process_chat_filters()
+
+        # 处理log_level
+        if 'log_level' in _config:
+            log_level = _config['log_level'].upper()
+            # 设置loguru的日志级别
+            try:
+                import loguru
+                # 移除现有处理器
+                logger.remove()
+                # 重新添加处理器
+                logger.add(
+                    sys.stderr,
+                    level=log_level,
+                    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
+                )
+                # 添加文件日志
+                logger.add(
+                    os.path.join(self.log_file_path, "tdl.log"),
+                    rotation="10 MB",
+                    retention="10 days",
+                    level=log_level,
+                )
+            except Exception as e:
+                logger.error(f"设置日志级别失败: {e}")
         
         return True
     

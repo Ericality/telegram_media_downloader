@@ -222,7 +222,7 @@ async def send_bark_notification(title: str, body: str, url: str = None):
 async def notify_worker(worker_id: int):
     """通知队列的worker"""
     logger.debug(f"通知Worker {worker_id} 启动")
-    
+
     while getattr(app, 'is_running', True) and not getattr(app, 'force_exit', False):
         try:
             # 使用带超时的get，避免阻塞
@@ -230,35 +230,45 @@ async def notify_worker(worker_id: int):
                 task = await asyncio.wait_for(notify_queue.get(), timeout=0.1)
             except asyncio.TimeoutError:
                 continue
-            
+
             task_type = task.get('type')
-            
+
             if task_type == 'bark_notification':
                 title = task.get('title')
                 body = task.get('body')
                 url = task.get('url')
-                
+
                 logger.debug(f"通知Worker {worker_id} 处理Bark通知: {title}")
-                
+
                 # 实际发送通知
-                success = await send_bark_notification_sync(title, body, url)
-                if success:
-                    logger.debug(f"通知Worker {worker_id}: {title} 发送成功")
-                else:
-                    logger.warning(f"通知Worker {worker_id}: {title} 发送失败")
-            
+                try:
+                    success = await send_bark_notification_sync(title, body, url)
+                    if success:
+                        logger.debug(f"通知Worker {worker_id}: {title} 发送成功")
+                    else:
+                        logger.warning(f"通知Worker {worker_id}: {title} 发送失败")
+                except Exception as e:
+                    logger.error(f"通知Worker {worker_id} 发送通知时出错: {e}")
+                finally:
+                    notify_queue.task_done()
+
             elif task_type == 'stats_notification':
                 # 可以添加其他类型的通知处理
                 pass
-            
-            notify_queue.task_done()
-            
+
         except asyncio.CancelledError:
             logger.debug(f"通知Worker {worker_id} 被取消")
             break
         except Exception as e:
             logger.error(f"通知Worker {worker_id} 异常: {e}")
+            try:
+                notify_queue.task_done()
+            except:
+                pass
             await asyncio.sleep(1)
+
+    # 确保worker退出时清理队列
+    logger.debug(f"通知Worker {worker_id} 退出")
 
 
 async def disk_space_monitor_task():
@@ -374,25 +384,62 @@ def collect_stats() -> Dict[str, Any]:
 
 def setup_exit_signal_handlers():
     """设置优雅退出的信号处理器"""
+
     def signal_handler(signum, frame):
         logger.info(f"接收到信号 {signum}，正在优雅退出...")
-        
+
         if hasattr(app, 'is_running'):
             app.is_running = False
-        
+
         if hasattr(app, 'force_exit'):
             app.force_exit = True
-        
+
+        # 强制取消所有任务
+        try:
+            # 取消所有异步任务
+            tasks = asyncio.all_tasks(app.loop)
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+        except:
+            pass
+
+        # 清空队列
+        try:
+            # 清空下载队列
+            while not download_queue.empty():
+                try:
+                    download_queue.get_nowait()
+                    download_queue.task_done()
+                except:
+                    break
+
+            # 清空通知队列
+            while not notify_queue.empty():
+                try:
+                    notify_queue.get_nowait()
+                    notify_queue.task_done()
+                except:
+                    break
+        except:
+            pass
+
         if signum == signal.SIGINT:
-            logger.info("等待活动任务完成，再次按Ctrl+C强制退出...")
-            signal.signal(signal.SIGINT, lambda s, f: sys.exit(1))
+            logger.info("正在退出，请稍候...")
+
+            # 设置3秒后强制退出
+            def force_exit():
+                logger.error("强制退出程序")
+                os._exit(1)
+
+            signal.signal(signal.SIGINT, lambda s, f: force_exit())
         elif signum == signal.SIGTERM:
             logger.info("收到终止信号，立即停止...")
             try:
                 app.update_config()
             except:
                 pass
-    
+
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
@@ -1175,22 +1222,68 @@ async def start_download_workers(client: pyrogram.Client):
 async def wait_for_queues_to_empty():
     """等待队列清空"""
     logger.info("等待所有队列任务完成...")
-    
-    max_wait_time = 300  # 最大等待5分钟
+
+    max_wait_time = 30  # 减少到30秒，避免长时间等待
     start_time = time.time()
-    
+
+    # 先尝试正常等待
     while time.time() - start_time < max_wait_time:
-        download_queue_size = download_queue.qsize()
-        notify_queue_size = notify_queue.qsize()
-        
-        if download_queue_size == 0 and notify_queue_size == 0:
-            logger.info("所有队列已清空")
-            return True
-        
-        logger.debug(f"等待队列清空: 下载队列={download_queue_size}, 通知队列={notify_queue_size}")
-        await asyncio.sleep(1)
-    
-    logger.warning("等待队列清空超时，强制退出")
+        try:
+            # 使用queue.qsize()可能会有问题，改用empty()方法
+            download_queue_size = download_queue.qsize() if hasattr(download_queue, 'qsize') else 0
+            notify_queue_size = notify_queue.qsize() if hasattr(notify_queue, 'qsize') else 0
+
+            logger.debug(f"队列状态: 下载队列={download_queue_size}, 通知队列={notify_queue_size}")
+
+            # 检查队列是否为空（更准确的方法）
+            is_download_queue_empty = download_queue.empty() if hasattr(download_queue, 'empty') else (
+                        download_queue_size == 0)
+            is_notify_queue_empty = notify_queue.empty() if hasattr(notify_queue, 'empty') else (notify_queue_size == 0)
+
+            if is_download_queue_empty and is_notify_queue_empty:
+                # 检查未完成的任务计数
+                unfinished_download_tasks = download_queue._unfinished_tasks if hasattr(download_queue,
+                                                                                        '_unfinished_tasks') else 0
+                unfinished_notify_tasks = notify_queue._unfinished_tasks if hasattr(notify_queue,
+                                                                                    '_unfinished_tasks') else 0
+
+                if unfinished_download_tasks == 0 and unfinished_notify_tasks == 0:
+                    logger.info("所有队列已清空")
+                    return True
+
+                logger.debug(f"未完成任务: 下载={unfinished_download_tasks}, 通知={unfinished_notify_tasks}")
+
+            await asyncio.sleep(1)
+        except Exception as e:
+            logger.error(f"检查队列状态时出错: {e}")
+            break
+
+    # 如果超时，强制清空队列
+    logger.warning("等待队列清空超时，强制清理队列...")
+
+    # 清空下载队列
+    try:
+        while not download_queue.empty():
+            try:
+                download_queue.get_nowait()
+                download_queue.task_done()
+            except (asyncio.QueueEmpty, ValueError):
+                break
+    except Exception as e:
+        logger.error(f"清空下载队列时出错: {e}")
+
+    # 清空通知队列
+    try:
+        while not notify_queue.empty():
+            try:
+                notify_queue.get_nowait()
+                notify_queue.task_done()
+            except (asyncio.QueueEmpty, ValueError):
+                break
+    except Exception as e:
+        logger.error(f"清空通知队列时出错: {e}")
+
+    logger.warning("队列已强制清空")
     return False
 
 
@@ -1278,8 +1371,6 @@ def print_config_summary(app):
         logger.info(f"  启用: {bark_config.get('enabled', False)}")
         if bark_config.get('enabled', False):
             logger.info(f"  URL: {'已设置' if bark_config.get('url') else '未设置'}")
-            if bark_config.get('url') and logger.level <= logging.DEBUG:
-                logger.debug(f"    具体URL: {bark_config.get('url')}")
             logger.info(f"  磁盘空间阈值: {bark_config.get('disk_space_threshold_gb', 10.0)}GB")
             logger.info(f"  空间检查间隔: {bark_config.get('space_check_interval', 300)}秒")
             logger.info(f"  统计通知间隔: {bark_config.get('stats_notification_interval', 3600)}秒")
