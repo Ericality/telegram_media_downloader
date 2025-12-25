@@ -1194,12 +1194,148 @@ async def wait_for_queues_to_empty():
     return False
 
 
+def print_config_summary(app):
+    """打印配置摘要，用于调试"""
+    logger.info("=" * 60)
+    logger.info("配置摘要 (用于调试)")
+    logger.info("=" * 60)
+    
+    # 基本信息
+    logger.info("基本信息:")
+    logger.info(f"  配置文件名: {app.config_file}")
+    logger.info(f"  数据文件名: {app.app_data_file}")
+    logger.info(f"  应用名称: {app.application_name}")
+    logger.info(f"  会话文件路径: {app.session_file_path}")
+    logger.info(f"  日志文件路径: {app.log_file_path}")
+    logger.info(f"  日志级别: {app.log_level}")
+    logger.info(f"  启动超时: {app.start_timeout}秒")
+    
+    # API配置（部分敏感信息隐藏）
+    logger.info("\nAPI配置:")
+    logger.info(f"  API ID: {'已设置' if app.api_id else '未设置'}")
+    logger.info(f"  API Hash: {'已设置' if app.api_hash else '未设置'}")
+    logger.info(f"  Bot Token: {'已设置' if app.bot_token else '未设置'}")
+    logger.info(f"  代理: {app.proxy if app.proxy else '未设置'}")
+    
+    # 下载配置
+    logger.info("\n下载配置:")
+    logger.info(f"  下载路径: {app.save_path}")
+    logger.info(f"  临时路径: {app.temp_save_path}")
+    logger.info(f"  媒体类型: {app.media_types}")
+    logger.info(f"  文件格式: {app.file_formats}")
+    logger.info(f"  最大下载任务数: {app.max_download_task}")
+    logger.info(f"  最大并发传输数: {app.max_concurrent_transmissions}")
+    logger.info(f"  隐藏文件名: {app.hide_file_name}")
+    logger.info(f"  日期格式: {app.date_format}")
+    logger.info(f"  启用文本下载: {app.enable_download_txt}")
+    logger.info(f"  丢弃无音视频: {app.drop_no_audio_video}")
+    
+    # 文件命名配置
+    logger.info("\n文件命名配置:")
+    logger.info(f"  文件路径前缀: {app.file_path_prefix}")
+    logger.info(f"  文件名前缀: {app.file_name_prefix}")
+    logger.info(f"  文件名前缀分隔符: {app.file_name_prefix_split}")
+    
+    # Web配置
+    logger.info("\nWeb配置:")
+    logger.info(f"  Web主机: {app.web_host}")
+    logger.info(f"  Web端口: {app.web_port}")
+    logger.info(f"  Web调试模式: {app.debug_web}")
+    logger.info(f"  Web登录密钥: {'已设置' if app.web_login_secret else '未设置'}")
+    
+    # 语言和权限
+    logger.info("\n语言和权限:")
+    logger.info(f"  语言: {app.language}")
+    logger.info(f"  允许的用户ID: {len(app.allowed_user_ids) if app.allowed_user_ids else 0}个")
+    if app.allowed_user_ids and len(app.allowed_user_ids) <= 10:
+        logger.info(f"    具体ID: {list(app.allowed_user_ids)}")
+    
+    # 聊天配置
+    logger.info("\n聊天配置:")
+    logger.info(f"  聊天数量: {len(app.chat_download_config)}")
+    for i, (chat_id, config) in enumerate(app.chat_download_config.items(), 1):
+        logger.info(f"  聊天 #{i}:")
+        logger.info(f"    ID: {chat_id}")
+        logger.info(f"    最后读取消息ID: {config.last_read_message_id}")
+        logger.info(f"    待重试消息数: {len(config.ids_to_retry)}")
+        logger.info(f"    过滤器: {config.download_filter[:50] + '...' if config.download_filter and len(config.download_filter) > 50 else config.download_filter}")
+        logger.info(f"    上传Telegram聊天ID: {config.upload_telegram_chat_id}")
+    
+    # 云存储配置
+    logger.info("\n云存储配置:")
+    logger.info(f"  启用文件上传: {app.cloud_drive_config.enable_upload_file}")
+    if app.cloud_drive_config.enable_upload_file:
+        logger.info(f"  上传适配器: {app.cloud_drive_config.upload_adapter}")
+        logger.info(f"  Rclone路径: {app.cloud_drive_config.rclone_path}")
+        logger.info(f"  远程目录: {app.cloud_drive_config.remote_dir}")
+        logger.info(f"  上传前压缩: {app.cloud_drive_config.before_upload_file_zip}")
+        logger.info(f"  上传后删除: {app.cloud_drive_config.after_upload_file_delete}")
+    
+    # Bark通知配置
+    logger.info("\nBark通知配置:")
+    if hasattr(app, 'bark_notification') and app.bark_notification:
+        bark_config = app.bark_notification
+        logger.info(f"  启用: {bark_config.get('enabled', False)}")
+        if bark_config.get('enabled', False):
+            logger.info(f"  URL: {'已设置' if bark_config.get('url') else '未设置'}")
+            if bark_config.get('url') and logger.level <= logging.DEBUG:
+                logger.debug(f"    具体URL: {bark_config.get('url')}")
+            logger.info(f"  磁盘空间阈值: {bark_config.get('disk_space_threshold_gb', 10.0)}GB")
+            logger.info(f"  空间检查间隔: {bark_config.get('space_check_interval', 300)}秒")
+            logger.info(f"  统计通知间隔: {bark_config.get('stats_notification_interval', 3600)}秒")
+            logger.info(f"  通知worker数量: {bark_config.get('notify_worker_count', 1)}")
+            logger.info(f"  通知事件列表: {bark_config.get('events_to_notify', [])}")
+    else:
+        logger.warning("  Bark通知配置未找到或为空!")
+    
+    # 其他配置
+    logger.info("\n其他配置:")
+    logger.info(f"  程序重启标志: {app.restart_program}")
+    logger.info(f"  上传Telegram后删除: {app.after_upload_telegram_delete}")
+    logger.info(f"  转发限制: {app.forward_limit_call.max_limit_call_times if hasattr(app, 'forward_limit_call') else '未设置'}")
+    
+    logger.info("=" * 60)
+
+
+def check_config_consistency(app):
+    """检查配置一致性"""
+    issues = []
+    
+    # 检查API配置
+    if not app.api_id or not app.api_hash:
+        issues.append("API ID或API Hash未设置")
+    
+    # 检查下载路径
+    if not os.path.exists(app.save_path):
+        logger.warning(f"下载路径不存在: {app.save_path}")
+        issues.append(f"下载路径不存在: {app.save_path}")
+    
+    # 检查媒体类型
+    if not app.media_types:
+        issues.append("媒体类型未设置")
+    
+    # 检查文件格式
+    if not app.file_formats:
+        issues.append("文件格式未设置")
+    
+    # 检查聊天配置
+    if not app.chat_download_config:
+        issues.append("聊天配置为空")
+    
+    # 检查Bark配置（如果启用）
+    if hasattr(app, 'bark_notification') and app.bark_notification.get('enabled', False):
+        if not app.bark_notification.get('url'):
+            issues.append("Bark通知已启用但URL未设置")
+    
+    return issues
+
 def main():
     """主函数"""
     setup_exit_signal_handlers()
     
     logger.info("=" * 60)
     logger.info("Telegram Media Downloader 启动")
+    logger.info(f"启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 60)
     
     tasks = []
@@ -1220,16 +1356,55 @@ def main():
         app.pre_run()
         init_web(app)
         
-        # 加载配置
-        import yaml
-        try:
-            with open(CONFIG_NAME, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f)
-                app.bark_notification = config.get('bark_notification', {})
-                logger.info(f"加载 Bark 配置成功: enabled={app.bark_notification.get('enabled', False)}")
-        except Exception as e:
-            logger.error(f"加载 Bark 配置失败: {e}")
-            app.bark_notification = {}
+        # ========== 配置调试信息 ==========
+        logger.info("正在验证配置...")
+        
+        # 打印配置摘要
+        print_config_summary(app)
+        
+        # 检查配置一致性
+        issues = check_config_consistency(app)
+        if issues:
+            logger.warning("配置检查发现问题:")
+            for i, issue in enumerate(issues, 1):
+                logger.warning(f"  {i}. {issue}")
+            logger.warning("程序可能无法正常工作!")
+        else:
+            logger.success("配置检查通过!")
+        
+        # 详细调试信息
+        if logger.level <= logging.DEBUG:
+            logger.debug("=" * 40)
+            logger.debug("详细配置信息:")
+            
+            # 列出app对象的所有属性
+            logger.debug("App对象属性列表:")
+            for attr_name in dir(app):
+                if not attr_name.startswith('_'):  # 不显示私有属性
+                    try:
+                        attr_value = getattr(app, attr_name)
+                        # 只显示简单类型的属性
+                        if not callable(attr_value):  # 排除方法
+                            logger.debug(f"  {attr_name}: {type(attr_value).__name__}")
+                    except:
+                        pass
+            
+            # 检查config字典内容
+            if hasattr(app, 'config') and app.config:
+                logger.debug("\nConfig字典内容:")
+                for key, value in app.config.items():
+                    if key not in ['api_id', 'api_hash', 'bot_token', 'web_login_secret']:  # 排除敏感信息
+                        logger.debug(f"  {key}: {value}")
+                    else:
+                        logger.debug(f"  {key}: [敏感信息已隐藏]")
+            logger.debug("=" * 40)
+        
+        # 检查Bark配置加载情况
+        if hasattr(app, 'bark_notification'):
+            logger.info(f"Bark配置类型: {type(app.bark_notification)}")
+            logger.info(f"Bark配置内容: {app.bark_notification}")
+        else:
+            logger.error("Bark配置属性不存在!")
         
         # 更新队列管理器配置
         queue_manager.update_limits()
@@ -1257,13 +1432,14 @@ def main():
         if not hasattr(app, 'is_running'):
             app.is_running = True
         
-        logger.info(f"配置信息:")
-        logger.info(f"  - 最大并发传输数: {app.max_concurrent_transmissions}")
-        logger.info(f"  - 最大下载worker数: {queue_manager.max_download_tasks}")
-        logger.info(f"  - 最大通知worker数: {queue_manager.max_notify_tasks}")
-        logger.info(f"  - 批量大小: {queue_manager.download_batch_size}")
-        logger.info(f"  - 媒体类型: {app.media_types}")
-        logger.info(f"  - 聊天配置数: {len(app.chat_download_config)}")
+        # 启动前的配置状态
+        logger.info("=" * 40)
+        logger.info("启动前配置状态:")
+        logger.info(f"  下载worker数: {queue_manager.max_download_tasks}")
+        logger.info(f"  通知worker数: {queue_manager.max_notify_tasks}")
+        logger.info(f"  批量大小: {queue_manager.download_batch_size}")
+        logger.info(f"  聊天配置数: {len(app.chat_download_config)}")
+        logger.info("=" * 40)
         
         # 启动通知worker（先于下载worker启动）
         notify_tasks = app.loop.run_until_complete(start_notify_workers())
@@ -1272,7 +1448,7 @@ def main():
         download_tasks = app.loop.run_until_complete(start_download_workers(client))
         
         # 启动监控任务
-        if getattr(app, 'bark_notification', {}).get('enabled', False):
+        if hasattr(app, 'bark_notification') and app.bark_notification.get('enabled', False):
             disk_monitor_task_obj = app.loop.create_task(disk_space_monitor_task())
             monitor_tasks.append(disk_monitor_task_obj)
             
@@ -1280,9 +1456,11 @@ def main():
             monitor_tasks.append(stats_task_obj)
             
             logger.info("磁盘空间监控和统计通知已启用")
+        else:
+            logger.info("Bark通知未启用，跳过监控任务")
         
         # 发送启动通知
-        if getattr(app, 'bark_notification', {}).get('enabled', False):
+        if hasattr(app, 'bark_notification') and app.bark_notification.get('enabled', False):
             events_to_notify = app.bark_notification.get('events_to_notify', [])
             if 'startup' in events_to_notify:
                 startup_msg = (
@@ -1324,7 +1502,7 @@ def main():
         logger.exception("{}", e)
     finally:
         # 发送关闭通知
-        if getattr(app, 'is_running', False) and getattr(app, 'bark_notification', {}).get('enabled', False):
+        if getattr(app, 'is_running', False) and hasattr(app, 'bark_notification') and app.bark_notification.get('enabled', False):
             events_to_notify = app.bark_notification.get('events_to_notify', [])
             if 'shutdown' in events_to_notify:
                 stats = collect_stats()
