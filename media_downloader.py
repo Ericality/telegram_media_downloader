@@ -718,7 +718,12 @@ async def notify_worker(worker_id: int):
     """通知队列的worker，添加延迟监控"""
     logger.debug(f"通知Worker {worker_id} 启动")
 
-    while getattr(app, 'is_running', True) and not getattr(app, 'force_exit', False):
+    while True:
+        # 检查是否要退出
+        if not getattr(app, 'is_running', True) or getattr(app, 'force_exit', False):
+            logger.debug(f"通知Worker {worker_id} 收到退出信号，准备退出")
+            break
+
         try:
             # 使用带超时的get，避免阻塞
             try:
@@ -1177,7 +1182,10 @@ async def graceful_shutdown():
 
 
 async def run_until_all_task_finish():
-    """正常运行直到所有任务完成或收到退出信号"""
+    """正常运行直到所有任务完成，并在完成后继续重试失败任务"""
+    logger.info("开始主运行循环...")
+
+    # 阶段1：处理所有新任务
     while True:
         # 检查是否要退出
         if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
@@ -1193,6 +1201,77 @@ async def run_until_all_task_finish():
             break
 
         await asyncio.sleep(1)
+
+    # 阶段2：重试失败任务（无限重试直到成功）
+    if getattr(app, 'is_running', True) and not getattr(app, 'force_exit', False):
+        logger.info("进入失败任务重试阶段...")
+
+        # 无限循环重试失败任务
+        while getattr(app, 'is_running', True) and not getattr(app, 'force_exit', False):
+            try:
+                # 检查是否有任何活动任务
+                has_active_tasks = False
+                for _, value in app.chat_download_config.items():
+                    if value.node and value.node.download_status:
+                        downloading_tasks = sum(1 for status in value.node.download_status.values()
+                                                if status == DownloadStatus.Downloading)
+                        if downloading_tasks > 0:
+                            has_active_tasks = True
+                            break
+
+                # 如果没有活动任务，尝试重试失败任务
+                if not has_active_tasks and download_queue.empty():
+                    # 为每个聊天重试失败任务
+                    total_retried = 0
+                    total_failed_tasks = 0
+
+                    for chat_id, value in app.chat_download_config.items():
+                        if value.node:
+                            # 加载失败任务数量
+                            failed_tasks = await load_failed_tasks(chat_id)
+                            total_failed_tasks += len(failed_tasks)
+
+                            if failed_tasks:
+                                logger.info(f"聊天 {chat_id} 有 {len(failed_tasks)} 个失败任务，开始重试...")
+
+                                # 每次重试一批（避免一次性添加太多）
+                                retried, added = await retry_failed_tasks(
+                                    value.node.client if value.node.client else client,
+                                    chat_id,
+                                    value.node,
+                                    max_batch=queue_manager.max_download_tasks * 2  # 根据worker数量调整
+                                )
+
+                                total_retried += retried
+
+                                if added > 0:
+                                    logger.info(f"已为聊天 {chat_id} 添加 {added} 个失败任务重试")
+                                    # 等待一段时间让新任务开始处理
+                                    await asyncio.sleep(5)
+
+                    # 如果没有任何失败任务需要重试，等待一段时间再检查
+                    if total_failed_tasks == 0:
+                        logger.info("当前没有失败任务需要重试，等待30秒后再次检查...")
+                        await asyncio.sleep(30)
+                    elif total_retried == 0:
+                        logger.info("尝试重试失败任务但未能获取消息，等待30秒后重试...")
+                        await asyncio.sleep(30)
+                    else:
+                        logger.info(f"本轮重试了 {total_retried} 个失败任务，等待处理完成...")
+                        await asyncio.sleep(10)
+                else:
+                    # 还有活动任务，等待
+                    await asyncio.sleep(5)
+
+                # 检查是否需要重启或停止
+                if getattr(app, 'restart_program', False) or getattr(app, 'force_exit', False):
+                    break
+
+            except Exception as e:
+                logger.error(f"重试失败任务循环中出错: {e}")
+                await asyncio.sleep(30)
+
+    logger.info("主运行循环结束")
 
 
 async def record_failed_task(chat_id: Union[int, str], message_id: int, error_msg: str):
@@ -1439,7 +1518,13 @@ async def add_download_task(
     last_notification_time = 0
     notification_interval = 3600  # 每1小时发送一次告警
 
-    while getattr(app, 'is_running', True) and not getattr(app, 'force_exit', False):
+    while True:
+        # 首先检查是否要退出
+        if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
+            logger.debug(f"程序正在退出，记录失败任务: message_id={message.id}")
+            await record_failed_task(node.chat_id, message.id, "程序退出")
+            return False
+
         try:
             # 检查队列是否有空位
             current_size = download_queue.qsize()
@@ -1449,6 +1534,12 @@ async def add_download_task(
                 # 有空位，添加任务
                 async with queue_manager.lock:
                     if current_size < queue_capacity:  # 双重检查
+                        # 再次检查是否要退出
+                        if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
+                            logger.debug(f"程序正在退出，记录失败任务: message_id={message.id}")
+                            await record_failed_task(node.chat_id, message.id, "程序退出")
+                            return False
+
                         node.download_status[message.id] = DownloadStatus.Downloading
                         await download_queue.put((message, node))
                         node.total_task += 1
@@ -1478,8 +1569,13 @@ async def add_download_task(
                     last_notification_time = current_time
                     logger.warning(f"任务添加等待时间过长: message_id={message.id}, 已等待{wait_minutes}分钟")
 
-            # 等待一段时间再检查
-            await asyncio.sleep(1)
+            # 等待一段时间再检查，但检查退出状态
+            for _ in range(10):  # 每0.1秒检查一次，总共1秒
+                await asyncio.sleep(0.1)
+                if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
+                    logger.debug(f"程序正在退出，记录失败任务: message_id={message.id}")
+                    await record_failed_task(node.chat_id, message.id, "程序退出")
+                    return False
 
         except asyncio.CancelledError:
             logger.info(f"添加任务被取消: message_id={message.id}")
@@ -1490,7 +1586,7 @@ async def add_download_task(
             logger.error(f"添加下载任务异常: {e}")
 
             # 检查是否要退出
-            if getattr(app, 'force_exit', False):
+            if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
                 logger.debug(f"程序正在退出，记录失败任务: message_id={message.id}")
                 await record_failed_task(node.chat_id, message.id, f"程序退出: {e}")
                 return False
@@ -1510,6 +1606,11 @@ async def add_download_task_batch(
         max_concurrent: int = 5  # 并发添加的任务数
 ) -> int:
     """批量添加下载任务（使用并发控制）"""
+    # 检查程序是否在运行
+    if not getattr(app, 'is_running', True) or getattr(app, 'force_exit', False):
+        logger.debug("程序不在运行状态，跳过批量添加")
+        return 0
+
     added_count = 0
     failed_count = 0
 
@@ -1519,6 +1620,14 @@ async def add_download_task_batch(
     async def add_single_task(msg):
         """添加单个任务的协程"""
         nonlocal added_count, failed_count
+
+        # 检查程序是否在运行
+        if not getattr(app, 'is_running', True) or getattr(app, 'force_exit', False):
+            logger.debug(f"程序不在运行状态，跳过任务: message_id={msg.id}")
+            failed_count += 1
+            await record_failed_task(node.chat_id, msg.id, "程序退出")
+            return
+
         try:
             async with semaphore:
                 success = await add_download_task(msg, node)
@@ -1535,7 +1644,13 @@ async def add_download_task_batch(
     tasks = [add_single_task(msg) for msg in messages]
 
     # 等待所有任务完成
-    await asyncio.gather(*tasks, return_exceptions=True)
+    try:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    except asyncio.CancelledError:
+        logger.warning("批量添加任务被取消")
+        # 记录剩余未处理的任务
+        for msg in messages[added_count + failed_count:]:
+            await record_failed_task(node.chat_id, msg.id, "批量添加被取消")
 
     if failed_count > 0:
         logger.warning(f"批量添加完成: 成功 {added_count} 个，失败 {failed_count} 个")
@@ -1850,9 +1965,9 @@ async def download_worker(client: pyrogram.client.Client, worker_id: int):
     """下载任务worker"""
     logger.debug(f"下载Worker {worker_id} 启动")
 
-    while getattr(app, 'is_running', True):
+    while True:
         # 检查是否要强制退出
-        if getattr(app, 'force_exit', False):
+        if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
             logger.debug(f"下载Worker {worker_id} 收到退出信号，准备退出")
             break
 
@@ -1893,7 +2008,7 @@ async def download_worker(client: pyrogram.client.Client, worker_id: int):
                 continue
 
             # 再次检查是否要退出
-            if getattr(app, 'force_exit', False):
+            if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
                 logger.debug(f"下载Worker {worker_id} 收到退出信号，将任务放回队列")
                 await download_queue.put((message, node))  # 放回队列
                 download_queue.task_done()  # 标记当前任务为完成
