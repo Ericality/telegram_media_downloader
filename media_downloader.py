@@ -2261,7 +2261,7 @@ def print_config_summary(app):
     logger.info("=" * 60)
     logger.info("配置摘要 (用于调试)")
     logger.info("=" * 60)
-    
+
     # 基本信息
     logger.info("基本信息:")
     logger.info(f"  配置文件名: {app.config_file}")
@@ -2271,14 +2271,14 @@ def print_config_summary(app):
     logger.info(f"  日志文件路径: {app.log_file_path}")
     logger.info(f"  日志级别: {app.log_level}")
     logger.info(f"  启动超时: {app.start_timeout}秒")
-    
+
     # API配置（部分敏感信息隐藏）
     logger.info("\nAPI配置:")
     logger.info(f"  API ID: {'已设置' if app.api_id else '未设置'}")
     logger.info(f"  API Hash: {'已设置' if app.api_hash else '未设置'}")
     logger.info(f"  Bot Token: {'已设置' if app.bot_token else '未设置'}")
     logger.info(f"  代理: {app.proxy if app.proxy else '未设置'}")
-    
+
     # 下载配置
     logger.info("\n下载配置:")
     logger.info(f"  下载路径: {app.save_path}")
@@ -2291,27 +2291,82 @@ def print_config_summary(app):
     logger.info(f"  日期格式: {app.date_format}")
     logger.info(f"  启用文本下载: {app.enable_download_txt}")
     logger.info(f"  丢弃无音视频: {app.drop_no_audio_video}")
-    
+
+    # 通知配置
+    logger.info("\n通知配置:")
+
+    # 检查是否有 notifications 配置
+    if hasattr(app, 'notifications'):
+        notifications = app.notifications
+        logger.info("  [新版配置]")
+
+        # Bark 配置
+        bark_config = notifications.get('bark', {})
+        logger.info(f"  Bark通知:")
+        logger.info(f"    启用: {bark_config.get('enabled', False)}")
+        if bark_config.get('enabled', False):
+            logger.info(f"    URL: {'已设置' if bark_config.get('url') else '未设置'}")
+            logger.info(f"    默认分组: {bark_config.get('default_group', 'TelegramDownloader')}")
+            logger.info(f"    默认级别: {bark_config.get('default_level', 'active')}")
+            logger.info(f"    磁盘空间阈值: {bark_config.get('disk_space_threshold_gb', 10.0)}GB")
+            logger.info(f"    空间检查间隔: {bark_config.get('space_check_interval', 300)}秒")
+            logger.info(f"    统计通知间隔: {bark_config.get('stats_notification_interval', 3600)}秒")
+            logger.info(f"    通知worker数量: {bark_config.get('notify_worker_count', 1)}")
+            logger.info(f"    通知事件列表: {bark_config.get('events_to_notify', [])}")
+
+        # 群晖 Chat 配置
+        synology_config = notifications.get('synology_chat', {})
+        logger.info(f"  群晖Chat通知:")
+        logger.info(f"    启用: {synology_config.get('enabled', False)}")
+        if synology_config.get('enabled', False):
+            logger.info(f"    Webhook URL: {'已设置' if synology_config.get('webhook_url') else '未设置'}")
+            logger.info(f"    机器人名称: {synology_config.get('bot_name', 'Telegram下载器')}")
+            logger.info(f"    默认级别: {synology_config.get('default_level', 'info')}")
+            logger.info(f"    通知事件列表: {synology_config.get('events_to_notify', [])}")
+
+        # 全局配置
+        global_config = notifications.get('global', {})
+        logger.info(f"  全局配置:")
+        logger.info(f"    统计通知间隔: {global_config.get('stats_notification_interval', 3600)}秒")
+        logger.info(f"    队列监控间隔: {global_config.get('queue_monitor_interval', 300)}秒")
+        logger.info(f"    最大重试次数: {global_config.get('max_notification_retries', 3)}")
+
+    # 同时检查旧版配置（向后兼容）
+    elif hasattr(app, 'bark_notification'):
+        bark_config = app.bark_notification
+        logger.info("  [旧版配置]")
+        logger.info(f"  Bark通知:")
+        logger.info(f"    启用: {bark_config.get('enabled', False)}")
+        if bark_config.get('enabled', False):
+            logger.info(f"    URL: {'已设置' if bark_config.get('url') else '未设置'}")
+            logger.info(f"    磁盘空间阈值: {bark_config.get('disk_space_threshold_gb', 10.0)}GB")
+            logger.info(f"    空间检查间隔: {bark_config.get('space_check_interval', 300)}秒")
+            logger.info(f"    统计通知间隔: {bark_config.get('stats_notification_interval', 3600)}秒")
+            logger.info(f"    通知worker数量: {bark_config.get('notify_worker_count', 1)}")
+            logger.info(f"    通知事件列表: {bark_config.get('events_to_notify', [])}")
+    else:
+        logger.info("  通知配置: 未找到")
+
     # 文件命名配置
     logger.info("\n文件命名配置:")
     logger.info(f"  文件路径前缀: {app.file_path_prefix}")
     logger.info(f"  文件名前缀: {app.file_name_prefix}")
     logger.info(f"  文件名前缀分隔符: {app.file_name_prefix_split}")
-    
+
     # Web配置
     logger.info("\nWeb配置:")
     logger.info(f"  Web主机: {app.web_host}")
     logger.info(f"  Web端口: {app.web_port}")
     logger.info(f"  Web调试模式: {app.debug_web}")
     logger.info(f"  Web登录密钥: {'已设置' if app.web_login_secret else '未设置'}")
-    
+
     # 语言和权限
     logger.info("\n语言和权限:")
     logger.info(f"  语言: {app.language}")
     logger.info(f"  允许的用户ID: {len(app.allowed_user_ids) if app.allowed_user_ids else 0}个")
     if app.allowed_user_ids and len(app.allowed_user_ids) <= 10:
         logger.info(f"    具体ID: {list(app.allowed_user_ids)}")
-    
+
     # 聊天配置
     logger.info("\n聊天配置:")
     logger.info(f"  聊天数量: {len(app.chat_download_config)}")
@@ -2320,9 +2375,10 @@ def print_config_summary(app):
         logger.info(f"    ID: {chat_id}")
         logger.info(f"    最后读取消息ID: {config.last_read_message_id}")
         logger.info(f"    待重试消息数: {len(config.ids_to_retry)}")
-        logger.info(f"    过滤器: {config.download_filter[:50] + '...' if config.download_filter and len(config.download_filter) > 50 else config.download_filter}")
+        logger.info(
+            f"    过滤器: {config.download_filter[:50] + '...' if config.download_filter and len(config.download_filter) > 50 else config.download_filter}")
         logger.info(f"    上传Telegram聊天ID: {config.upload_telegram_chat_id}")
-    
+
     # 云存储配置
     logger.info("\n云存储配置:")
     logger.info(f"  启用文件上传: {app.cloud_drive_config.enable_upload_file}")
@@ -2332,28 +2388,14 @@ def print_config_summary(app):
         logger.info(f"  远程目录: {app.cloud_drive_config.remote_dir}")
         logger.info(f"  上传前压缩: {app.cloud_drive_config.before_upload_file_zip}")
         logger.info(f"  上传后删除: {app.cloud_drive_config.after_upload_file_delete}")
-    
-    # Bark通知配置
-    logger.info("\nBark通知配置:")
-    if hasattr(app, 'bark_notification') and app.bark_notification:
-        bark_config = app.bark_notification
-        logger.info(f"  启用: {bark_config.get('enabled', False)}")
-        if bark_config.get('enabled', False):
-            logger.info(f"  URL: {'已设置' if bark_config.get('url') else '未设置'}")
-            logger.info(f"  磁盘空间阈值: {bark_config.get('disk_space_threshold_gb', 10.0)}GB")
-            logger.info(f"  空间检查间隔: {bark_config.get('space_check_interval', 300)}秒")
-            logger.info(f"  统计通知间隔: {bark_config.get('stats_notification_interval', 3600)}秒")
-            logger.info(f"  通知worker数量: {bark_config.get('notify_worker_count', 1)}")
-            logger.info(f"  通知事件列表: {bark_config.get('events_to_notify', [])}")
-    else:
-        logger.warning("  Bark通知配置未找到或为空!")
-    
+
     # 其他配置
     logger.info("\n其他配置:")
     logger.info(f"  程序重启标志: {app.restart_program}")
     logger.info(f"  上传Telegram后删除: {app.after_upload_telegram_delete}")
-    logger.info(f"  转发限制: {app.forward_limit_call.max_limit_call_times if hasattr(app, 'forward_limit_call') else '未设置'}")
-    
+    logger.info(
+        f"  转发限制: {app.forward_limit_call.max_limit_call_times if hasattr(app, 'forward_limit_call') else '未设置'}")
+
     logger.info("=" * 60)
 
 

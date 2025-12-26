@@ -339,7 +339,7 @@ def get_config(config, key, default=None, val_type=str, verbose=True):
 
 class ConfigSchema:
     """配置架构定义，描述每个配置项的默认值、类型和转换函数"""
-    
+
     # 基础配置架构
     BASE_CONFIG = {
         # 键名: (默认值, 类型, 转换函数或None)
@@ -372,37 +372,75 @@ class ConfigSchema:
         "date_format": ("%Y_%m", str, None),
         "drop_no_audio_video": (False, bool, None),
         "enable_download_txt": (False, bool, None),
-        "bark_notification": ({
-            'enabled': False,
-            'url': '',
-            'disk_space_threshold_gb': 10.0,
-            'space_check_interval': 300,
-            'stats_notification_interval': 3600,
-            'notify_worker_count': 1,
-            'events_to_notify': []
-        }, dict, None),
         "forward_limit": (33, int, None),
     }
-    
+
+    # 新增：通知配置架构
+    NOTIFICATION_CONFIG = {
+        # 键名: (默认值, 类型, 转换函数或None)
+        "notifications": ({
+                              # Bark 配置
+                              "bark": {
+                                  "enabled": False,
+                                  "url": "",
+                                  "default_group": "TelegramDownloader",
+                                  "default_level": "active",
+                                  "events_to_notify": [],
+                                  "disk_space_threshold_gb": 10.0,
+                                  "space_check_interval": 300,
+                                  "stats_notification_interval": 3600,
+                                  "notify_worker_count": 1
+                              },
+                              # 群晖 Chat 配置
+                              "synology_chat": {
+                                  "enabled": False,
+                                  "webhook_url": "",
+                                  "bot_name": "Telegram下载器",
+                                  "bot_avatar": "https://telegram.org/img/t_logo.png",
+                                  "default_level": "info",
+                                  "events_to_notify": [],
+                                  "mention_users": [],
+                                  "mention_channels": [],
+                                  "disk_space_threshold_gb": 10.0,
+                                  "space_check_interval": 300
+                              },
+                              # 全局配置
+                              "global": {
+                                  "stats_notification_interval": 3600,
+                                  "queue_monitor_interval": 300,
+                                  "max_notification_retries": 3,
+                                  "default_timeout": 15
+                              }
+                          }, dict, None),
+    }
+
+    @classmethod
+    def get_all_configs(cls):
+        """获取所有配置项"""
+        return {**cls.BASE_CONFIG, **cls.NOTIFICATION_CONFIG}
+
     @classmethod
     def get_default(cls, key):
         """获取配置项的默认值"""
-        if key in cls.BASE_CONFIG:
-            return cls.BASE_CONFIG[key][0]
+        all_configs = cls.get_all_configs()
+        if key in all_configs:
+            return all_configs[key][0]
         return None
-    
+
     @classmethod
     def get_type(cls, key):
         """获取配置项的类型"""
-        if key in cls.BASE_CONFIG:
-            return cls.BASE_CONFIG[key][1]
+        all_configs = cls.get_all_configs()
+        if key in all_configs:
+            return all_configs[key][1]
         return type(None)
-    
+
     @classmethod
     def get_converter(cls, key):
         """获取配置项的转换函数"""
-        if key in cls.BASE_CONFIG:
-            return cls.BASE_CONFIG[key][2]
+        all_configs = cls.get_all_configs()
+        if key in all_configs:
+            return all_configs[key][2]
         return None
 
 
@@ -410,10 +448,10 @@ class Application:
     """Application load config and update config."""
 
     def __init__(
-        self,
-        config_file: str,
-        app_data_file: str,
-        application_name: str = "UndefineApp",
+            self,
+            config_file: str,
+            app_data_file: str,
+            application_name: str = "UndefineApp",
     ):
         """
         Init and update telegram media downloader config
@@ -443,10 +481,10 @@ class Application:
         self.cloud_drive_config = CloudDriveConfig()
         self.caption_name_dict: dict = {}
         self.caption_entities_dict: dict = {}
-        
+
         # 使用配置架构初始化所有配置项
         self._init_config_from_schema()
-        
+
         self.forward_limit_call = LimitCall(max_limit_call_times=self.forward_limit)
 
         self.loop = asyncio.new_event_loop()
@@ -458,7 +496,7 @@ class Application:
 
     def _init_config_from_schema(self):
         """根据配置架构初始化所有配置项"""
-        for key, (default_value, value_type, converter) in ConfigSchema.BASE_CONFIG.items():
+        for key, (default_value, value_type, converter) in ConfigSchema.get_all_configs().items():
             setattr(self, key, default_value)
 
     def _load_and_convert_value(self, key: str, raw_value: Any) -> Any:
@@ -506,7 +544,7 @@ class Application:
         except Exception as e:
             logger.error(f"处理配置项 {key} 时出错: {e}")
             return ConfigSchema.get_default(key)
-    
+
     def assign_config(self, _config: dict) -> bool:
         """assign config from str.
 
@@ -521,19 +559,22 @@ class Application:
         """
         # 处理特殊配置项（需要复杂逻辑的）
         self._process_special_configs(_config)
-        
+
+        # 处理通知配置（必须放在通用配置之前，因为它会修改 _config）
+        self._process_notifications_config(_config)
+
         # 处理通用配置项
         self._process_general_configs(_config)
-        
+
         # 处理聊天配置
         self._process_chat_configs(_config)
-        
+
         # 处理云存储配置
         self._process_cloud_drive_config(_config)
-        
+
         # 处理日期格式
         self._validate_date_format()
-        
+
         # 处理聊天配置的过滤器
         self._process_chat_filters()
 
@@ -542,6 +583,7 @@ class Application:
             log_level = _config['log_level'].upper()
             # 设置loguru的日志级别
             try:
+                import sys
                 import loguru
                 # 移除现有处理器
                 logger.remove()
@@ -560,21 +602,21 @@ class Application:
                 )
             except Exception as e:
                 logger.error(f"设置日志级别失败: {e}")
-        
+
         return True
-    
+
     def _process_special_configs(self, _config: dict):
         """处理需要特殊逻辑的配置项"""
         # 从配置中提取特殊的配置项并设置
         if "save_path" in _config:
             self.save_path = _config["save_path"]
-        
+
         # 媒体类型和文件格式是必须的
         if "media_types" in _config:
             self.media_types = _config["media_types"]
         if "file_formats" in _config:
             self.file_formats = _config["file_formats"]
-    
+
     def _process_general_configs(self, _config: dict):
         """处理通用配置项"""
         # 遍历配置架构中的所有键
@@ -583,14 +625,14 @@ class Application:
                 raw_value = _config[key]
                 converted_value = self._load_and_convert_value(key, raw_value)
                 setattr(self, key, converted_value)
-                
+
                 # 记录日志（可选）
                 if key in ['api_id', 'api_hash', 'bot_token', 'web_login_secret']:
                     masked_value = '****' if raw_value else ''
                     logger.debug(f"加载配置 {key}: {masked_value}")
                 else:
                     logger.debug(f"加载配置 {key}: {raw_value}")
-    
+
     def _process_chat_configs(self, _config: dict):
         """处理聊天配置"""
         if "chat" in _config:
@@ -644,7 +686,7 @@ class Application:
                 self.config["chat"][0]["download_filter"] = download_filter_dict[
                     self._chat_id
                 ]
-    
+
     def _process_cloud_drive_config(self, _config: dict):
         """处理云存储配置"""
         if "upload_drive" in _config:
@@ -674,7 +716,7 @@ class Application:
                 self.cloud_drive_config.upload_adapter = upload_drive_config[
                     "upload_adapter"
                 ]
-    
+
     def _validate_date_format(self):
         """验证日期格式"""
         try:
@@ -683,7 +725,7 @@ class Application:
         except Exception as e:
             logger.warning(f"配置日期格式错误: {e}")
             self.date_format = "%Y_%m"
-    
+
     def _process_chat_filters(self):
         """处理聊天过滤器"""
         for key, value in self.chat_download_config.items():
@@ -1065,3 +1107,109 @@ class Application:
         self.chat_download_config[node.chat_id].last_read_message_id = max(
             self.chat_download_config[node.chat_id].last_read_message_id, message_id
         )
+
+    def _process_notifications_config(self, _config: dict):
+        """处理通知配置，支持旧版和新版配置"""
+        # 先检查是否有旧版的 bark_notification 配置
+        if "bark_notification" in _config:
+            bark_config = _config["bark_notification"]
+            logger.info("检测到旧版 Bark 配置，正在转换为新版格式...")
+
+            # 构建新的 notifications 配置
+            new_notifications = {
+                "bark": {
+                    "enabled": bark_config.get("enabled", False),
+                    "url": bark_config.get("url", ""),
+                    "default_group": bark_config.get("default_group", "TelegramDownloader"),
+                    "default_level": bark_config.get("default_level", "active"),
+                    "events_to_notify": bark_config.get("events_to_notify", []),
+                    "disk_space_threshold_gb": bark_config.get("disk_space_threshold_gb", 10.0),
+                    "space_check_interval": bark_config.get("space_check_interval", 300),
+                    "stats_notification_interval": bark_config.get("stats_notification_interval", 3600),
+                    "notify_worker_count": bark_config.get("notify_worker_count", 1)
+                },
+                "synology_chat": {
+                    "enabled": False,
+                    "webhook_url": "",
+                    "bot_name": "Telegram下载器",
+                    "default_level": "info",
+                    "events_to_notify": [],
+                    "disk_space_threshold_gb": 10.0,
+                    "space_check_interval": 300
+                },
+                "global": {
+                    "stats_notification_interval": bark_config.get("stats_notification_interval", 3600),
+                    "queue_monitor_interval": 300,
+                    "max_notification_retries": 3,
+                    "default_timeout": 15
+                }
+            }
+
+            # 将新配置合并到现有配置
+            if "notifications" not in _config:
+                _config["notifications"] = new_notifications
+            else:
+                # 合并配置，新版配置优先
+                existing = _config["notifications"]
+                if "bark" not in existing:
+                    existing["bark"] = new_notifications["bark"]
+                else:
+                    # 合并 Bark 配置，新版优先
+                    for key, value in new_notifications["bark"].items():
+                        if key not in existing["bark"]:
+                            existing["bark"][key] = value
+
+                # 确保其他配置也存在
+                if "synology_chat" not in existing:
+                    existing["synology_chat"] = new_notifications["synology_chat"]
+                if "global" not in existing:
+                    existing["global"] = new_notifications["global"]
+
+            # 从配置中移除旧版配置
+            _config.pop("bark_notification")
+            logger.info("已将旧版 Bark 配置转换为新版 notifications 格式")
+
+        # 处理新版 notifications 配置
+        if "notifications" in _config:
+            notifications_config = _config["notifications"]
+
+            # 确保所有必需的子配置都存在
+            if "bark" not in notifications_config:
+                notifications_config["bark"] = {
+                    "enabled": False,
+                    "url": "",
+                    "default_group": "TelegramDownloader",
+                    "default_level": "active",
+                    "events_to_notify": []
+                }
+
+            if "synology_chat" not in notifications_config:
+                notifications_config["synology_chat"] = {
+                    "enabled": False,
+                    "webhook_url": "",
+                    "bot_name": "Telegram下载器",
+                    "default_level": "info",
+                    "events_to_notify": []
+                }
+
+            if "global" not in notifications_config:
+                notifications_config["global"] = {
+                    "stats_notification_interval": 3600,
+                    "queue_monitor_interval": 300,
+                    "max_notification_retries": 3,
+                    "default_timeout": 15
+                }
+
+            # 设置到实例属性
+            self.notifications = notifications_config
+
+            # 为了向后兼容，也设置 bark_notification 属性
+            self.bark_notification = notifications_config.get("bark", {})
+
+            logger.debug(f"已加载通知配置: Bark={notifications_config['bark'].get('enabled', False)}, "
+                         f"SynologyChat={notifications_config['synology_chat'].get('enabled', False)}")
+        else:
+            # 如果没有 notifications 配置，使用默认值
+            self.notifications = ConfigSchema.get_default("notifications")
+            self.bark_notification = self.notifications.get("bark", {})
+            logger.debug("使用默认通知配置")
