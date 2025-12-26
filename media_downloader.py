@@ -534,12 +534,13 @@ async def send_synology_chat_notification_sync(
         mention_channels: list = None,
         max_retries: int = 2
 ) -> bool:
-    """发送群晖 Chat Bot 通知"""
+    """发送群晖 Chat Bot 通知（使用 application/x-www-form-urlencoded 格式）"""
     # 获取配置
     notifications_config = getattr(app, 'notifications', {})
     synology_config = notifications_config.get('synology_chat', {})
 
     if not synology_config.get('enabled', False):
+        logger.debug("群晖 Chat Bot 未启用")
         return False
 
     if not webhook_url:
@@ -549,11 +550,31 @@ async def send_synology_chat_notification_sync(
         logger.warning("群晖 Chat Bot Webhook URL 未设置")
         return False
 
-    if not bot_name:
-        bot_name = synology_config.get('bot_name', 'Telegram下载器')
+    # 记录 Webhook URL（隐藏敏感信息）
+    safe_url = webhook_url
+    if "token=" in safe_url:
+        # 隐藏 token 的一部分
+        parts = safe_url.split("token=")
+        if len(parts) > 1:
+            token = parts[1]
+            if len(token) > 10:
+                masked_token = token[:10] + "..." + token[-5:]
+                safe_url = parts[0] + "token=" + masked_token
 
-    if not bot_avatar:
-        bot_avatar = synology_config.get('bot_avatar', 'https://telegram.org/img/t_logo.png')
+    logger.debug(f"群晖 Chat Webhook URL: {safe_url}")
+
+    # 根据级别选择表情
+    level_config = {
+        "info": {"emoji": "ℹ️"},
+        "warning": {"emoji": "⚠️"},
+        "error": {"emoji": "❌"},
+        "success": {"emoji": "✅"}
+    }
+
+    level_info = level_config.get(level.lower(), level_config["info"])
+
+    # 构建完整消息
+    full_message = f"{level_info['emoji']} {title}\n\n{message}"
 
     # 构建 mention 字符串
     mention_text = ""
@@ -565,73 +586,86 @@ async def send_synology_chat_notification_sync(
         for channel in mention_channels:
             mention_text += f"#{channel} "
 
-    # 根据级别选择颜色和表情
-    level_config = {
-        "info": {"color": "#36a64f", "emoji": "ℹ️"},
-        "warning": {"color": "#ffcc00", "emoji": "⚠️"},
-        "error": {"color": "#ff0000", "emoji": "❌"},
-        "success": {"color": "#00cc00", "emoji": "✅"}
-    }
-
-    level_info = level_config.get(level.lower(), level_config["info"])
-
-    # 构建完整消息
-    full_message = f"{level_info['emoji']} {title}\n\n{message}"
     if mention_text:
         full_message += f"\n\n{mention_text}"
 
-    # 群晖 Chat Webhook 支持多种格式，这里使用最简单的文本格式
-    payload = {
-        "text": full_message
-    }
+    logger.debug(f"准备发送群晖 Chat 通知: {title}, 级别: {level}")
 
-    # 如果支持更丰富的格式，可以使用 attachments
-    attachments_payload = {
-        "text": full_message,
-        "attachments": [
-            {
-                "title": title,
-                "text": message,
-                "color": level_info["color"],
-                "author_name": bot_name,
-                "author_icon": bot_avatar
+    # 构建 payload（根据测试成功的格式）
+    payload_json = {"text": full_message}
+
+    # 将 payload_json 转换为字符串并进行 URL 编码
+    import urllib.parse
+    payload_str = json.dumps(payload_json, ensure_ascii=False)
+    encoded_payload = urllib.parse.quote(payload_str)
+
+    data = f"payload={encoded_payload}"
+
+    logger.debug(f"请求数据长度: {len(data)} 字符")
+
+    for retry in range(max_retries + 1):
+        try:
+            timeout = aiohttp.ClientTimeout(total=15)
+            headers = {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json"
             }
-        ]
-    }
 
-    # 尝试两种格式
-    for payload_to_try in [attachments_payload, payload]:
-        for retry in range(max_retries + 1):
-            try:
-                timeout = aiohttp.ClientTimeout(total=15)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.post(webhook_url, json=payload_to_try, timeout=timeout) as response:
-                        if response.status in [200, 201, 204]:
-                            logger.debug(f"群晖 Chat 通知发送成功: {title}, 级别: {level}")
-                            return True
-                        else:
-                            response_text = await response.text()
-                            logger.warning(
-                                f"群晖 Chat 通知发送失败: HTTP {response.status}, 响应: {response_text[:100]}")
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.post(webhook_url, data=data, timeout=timeout) as response:
+                    response_text = await response.text()
 
-                            if retry < max_retries:
-                                wait_time = 2 ** retry
-                                logger.info(f"等待 {wait_time} 秒后重试 ({retry + 1}/{max_retries})...")
-                                await asyncio.sleep(wait_time)
+                    if response.status in [200, 201, 204]:
+                        try:
+                            response_json = json.loads(response_text)
+                            if response_json.get("success", False):
+                                logger.info(f"群晖 Chat 通知发送成功: {title}")
+                                return True
                             else:
-                                return False
-            except asyncio.TimeoutError:
-                logger.warning(f"群晖 Chat 通知超时 ({retry + 1}/{max_retries + 1})")
-                if retry < max_retries:
-                    await asyncio.sleep(2 ** retry)
-            except aiohttp.ClientError as e:
-                logger.warning(f"群晖 Chat 通知网络错误: {e} ({retry + 1}/{max_retries + 1})")
-                if retry < max_retries:
-                    await asyncio.sleep(2 ** retry)
-            except Exception as e:
-                logger.error(f"发送群晖 Chat 通知时出错: {e}")
-                return False
+                                error_msg = response_json.get("error", {}).get("errors", "未知错误")
+                                logger.warning(f"群晖 Chat 通知返回失败: {error_msg}")
+                        except json.JSONDecodeError:
+                            # 响应不是 JSON，但状态码是成功的
+                            logger.info(f"群晖 Chat 通知发送成功，但响应不是JSON: {response_text[:100]}")
+                            return True
+                        except Exception as e:
+                            logger.warning(f"解析群晖 Chat 响应时出错: {e}, 响应: {response_text[:100]}")
+                            # 即使解析出错，如果状态码是成功的，也认为是成功
+                            return True
+                    else:
+                        logger.warning(f"群晖 Chat 通知发送失败: HTTP {response.status}")
 
+                        # 尝试解析错误信息
+                        try:
+                            error_json = json.loads(response_text)
+                            error_msg = error_json.get("error", {}).get("errors", response_text[:200])
+                            logger.debug(f"错误详情: {error_msg}")
+                        except:
+                            logger.debug(f"响应内容: {response_text[:200]}")
+
+                        if retry < max_retries:
+                            wait_time = 2 ** retry
+                            logger.info(f"等待 {wait_time} 秒后重试 ({retry + 1}/{max_retries})...")
+                            await asyncio.sleep(wait_time)
+                        else:
+                            return False
+        except asyncio.TimeoutError:
+            logger.warning(f"群晖 Chat 通知超时 ({retry + 1}/{max_retries + 1})")
+            if retry < max_retries:
+                await asyncio.sleep(2 ** retry)
+            else:
+                break
+        except aiohttp.ClientError as e:
+            logger.warning(f"群晖 Chat 通知网络错误: {e} ({retry + 1}/{max_retries + 1})")
+            if retry < max_retries:
+                await asyncio.sleep(2 ** retry)
+            else:
+                break
+        except Exception as e:
+            logger.error(f"发送群晖 Chat 通知时出错: {e}")
+            return False
+
+    logger.error(f"群晖 Chat 通知发送失败，已尝试 {max_retries + 1} 次")
     return False
 
 
