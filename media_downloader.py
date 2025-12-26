@@ -199,6 +199,179 @@ logging.getLogger("pyrogram.client").addFilter(LogFilter())
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 
+class NotificationManager:
+    """通知管理器，统一管理各种通知方式"""
+
+    def __init__(self):
+        self.bark_enabled = False
+        self.synology_chat_enabled = False
+        self.bark_config = {}
+        self.synology_chat_config = {}
+        self.global_config = {}
+
+    def load_config(self):
+        """加载通知配置"""
+        notifications_config = getattr(app, 'notifications', {})
+
+        # Bark 配置
+        self.bark_config = notifications_config.get('bark', {})
+        self.bark_enabled = self.bark_config.get('enabled', False)
+
+        # 群晖 Chat 配置
+        self.synology_chat_config = notifications_config.get('synology_chat', {})
+        self.synology_chat_enabled = self.synology_chat_config.get('enabled', False)
+
+        # 全局配置
+        self.global_config = notifications_config.get('global', {})
+
+        logger.info(f"通知管理器加载: Bark={self.bark_enabled}, 群晖Chat={self.synology_chat_enabled}")
+
+    def should_notify(self, event_type: str, notification_type: str = None) -> bool:
+        """检查是否应该发送某种类型的通知"""
+        if notification_type == 'bark':
+            if not self.bark_enabled:
+                return False
+            events_to_notify = self.bark_config.get('events_to_notify', [])
+            return event_type in events_to_notify
+
+        elif notification_type == 'synology_chat':
+            if not self.synology_chat_enabled:
+                return False
+            events_to_notify = self.synology_chat_config.get('events_to_notify', [])
+            return event_type in events_to_notify
+
+        # 如果不指定通知类型，检查是否有任何通知方式需要发送
+        bark_should = self.should_notify(event_type, 'bark')
+        synology_should = self.should_notify(event_type, 'synology_chat')
+        return bark_should or synology_should
+
+    async def send_event_notification(self, event_type: str, title: str, body: str,
+                                      level: str = None, custom_config: dict = None):
+        """发送事件通知，自动选择合适的通知方式"""
+        tasks = []
+
+        # 发送 Bark 通知
+        if self.should_notify(event_type, 'bark'):
+            # 获取 Bark 配置
+            bark_group = self.bark_config.get('default_group')
+            bark_level = level or self.bark_config.get('default_level')
+
+            # 如果有自定义配置，覆盖默认值
+            if custom_config and custom_config.get('bark'):
+                bark_group = custom_config['bark'].get('group', bark_group)
+                bark_level = custom_config['bark'].get('level', bark_level)
+
+            task = asyncio.create_task(
+                send_bark_notification(title, body, group=bark_group, level=bark_level)
+            )
+            tasks.append(task)
+
+        # 发送群晖 Chat 通知
+        if self.should_notify(event_type, 'synology_chat'):
+            # 获取群晖 Chat 配置
+            synology_level = level or self.synology_chat_config.get('default_level', 'info')
+
+            # 如果有自定义配置，覆盖默认值
+            if custom_config and custom_config.get('synology_chat'):
+                synology_level = custom_config['synology_chat'].get('level', synology_level)
+
+            task = asyncio.create_task(
+                send_synology_chat_notification(title, body, level=synology_level)
+            )
+            tasks.append(task)
+
+        # 等待所有通知发送完成
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            success_count = sum(1 for r in results if r is True and not isinstance(r, Exception))
+
+            if success_count == 0:
+                logger.warning(f"事件 {event_type} 的所有通知发送失败")
+            elif success_count < len(tasks):
+                logger.warning(f"事件 {event_type} 的部分通知发送失败")
+
+            return success_count > 0
+
+        return False
+
+    async def send_disk_space_notification(self, has_space: bool, available_gb: float,
+                                           total_gb: float, threshold_gb: float):
+        """发送磁盘空间通知"""
+        if has_space:
+            title = "磁盘空间充足"
+            message = f"✅ 磁盘空间充足\n可用空间: {available_gb:.2f}GB / {total_gb:.2f}GB\n阈值: {threshold_gb}GB"
+            event_type = "disk_space_ok"
+            level = "info"
+        else:
+            title = "磁盘空间不足"
+            message = f"⚠️ 磁盘空间不足\n可用空间: {available_gb:.2f}GB / {total_gb:.2f}GB\n阈值: {threshold_gb}GB"
+            event_type = "disk_space_low"
+            level = "warning"
+
+        return await self.send_event_notification(event_type, title, message, level)
+
+    async def send_queue_notification(self, current_size: int, capacity: int,
+                                      wait_time_minutes: int = None):
+        """发送队列状态通知"""
+        usage_percent = int(current_size / capacity * 100) if capacity > 0 else 0
+
+        if wait_time_minutes and wait_time_minutes > 60:
+            title = "队列长时间满载"
+            message = f"⚠️ 队列长时间满载\n使用率: {current_size}/{capacity} ({usage_percent}%)\n已等待: {wait_time_minutes}分钟"
+            event_type = "queue_full"
+            level = "warning"
+        else:
+            title = "队列状态报告"
+            message = f"📊 队列状态报告\n使用率: {current_size}/{capacity} ({usage_percent}%)"
+            event_type = "queue_status"
+            level = "info"
+
+        return await self.send_event_notification(event_type, title, message, level)
+
+    async def send_stats_notification(self, stats: dict):
+        """发送统计通知"""
+        title = "下载统计"
+        message = (
+            f"📊 统计摘要\n"
+            f"运行时间: {stats.get('uptime', 'N/A')}\n"
+            f"完成任务: {stats.get('tasks_completed', 0)}\n"
+            f"失败任务(待重试): {stats.get('failed_tasks_pending', 0)}\n"
+            f"下载大小: {stats.get('download_size_mb', 0):.2f}MB\n"
+            f"磁盘可用: {stats.get('disk_available_gb', 0):.2f}GB/{stats.get('disk_total_gb', 0):.2f}GB\n"
+            f"活动任务: {stats.get('active_tasks', 0)}\n"
+            f"队列任务: {stats.get('queued_tasks', 0)}\n"
+            f"空间不足: {'是' if stats.get('space_low', False) else '否'}"
+        )
+
+        return await self.send_event_notification("stats_summary", title, message, "info")
+
+    async def send_test_notification(self):
+        """发送测试通知"""
+        test_title = "测试通知"
+        test_message = "Telegram媒体下载器通知系统测试成功！"
+
+        # 测试 Bark
+        bark_success = False
+        if self.bark_enabled:
+            bark_success = await send_bark_notification(test_title, test_message)
+            logger.info(f"Bark测试通知: {'成功' if bark_success else '失败'}")
+
+        # 测试群晖 Chat
+        synology_success = False
+        if self.synology_chat_enabled:
+            synology_success = await send_synology_chat_notification(test_title, test_message)
+            logger.info(f"群晖Chat测试通知: {'成功' if synology_success else '失败'}")
+
+        return {
+            "bark": bark_success,
+            "synology_chat": synology_success
+        }
+
+
+# 全局通知管理器实例
+notification_manager = NotificationManager()
+
+
 # 磁盘空间监控状态
 class DiskSpaceMonitor:
     def __init__(self):
@@ -350,6 +523,154 @@ async def send_bark_notification(
         return False
 
 
+async def send_synology_chat_notification_sync(
+        title: str,
+        message: str,
+        level: str = "info",
+        webhook_url: str = None,
+        bot_name: str = None,
+        bot_avatar: str = None,
+        mention_users: list = None,
+        mention_channels: list = None,
+        max_retries: int = 2
+) -> bool:
+    """发送群晖 Chat Bot 通知"""
+    # 获取配置
+    notifications_config = getattr(app, 'notifications', {})
+    synology_config = notifications_config.get('synology_chat', {})
+
+    if not synology_config.get('enabled', False):
+        return False
+
+    if not webhook_url:
+        webhook_url = synology_config.get('webhook_url', '')
+
+    if not webhook_url:
+        logger.warning("群晖 Chat Bot Webhook URL 未设置")
+        return False
+
+    if not bot_name:
+        bot_name = synology_config.get('bot_name', 'Telegram下载器')
+
+    if not bot_avatar:
+        bot_avatar = synology_config.get('bot_avatar', 'https://telegram.org/img/t_logo.png')
+
+    # 构建 mention 字符串
+    mention_text = ""
+    if mention_users:
+        for user in mention_users:
+            mention_text += f"@{user} "
+
+    if mention_channels:
+        for channel in mention_channels:
+            mention_text += f"#{channel} "
+
+    # 根据级别选择颜色和表情
+    level_config = {
+        "info": {"color": "#36a64f", "emoji": "ℹ️"},
+        "warning": {"color": "#ffcc00", "emoji": "⚠️"},
+        "error": {"color": "#ff0000", "emoji": "❌"},
+        "success": {"color": "#00cc00", "emoji": "✅"}
+    }
+
+    level_info = level_config.get(level.lower(), level_config["info"])
+
+    # 构建完整消息
+    full_message = f"{level_info['emoji']} {title}\n\n{message}"
+    if mention_text:
+        full_message += f"\n\n{mention_text}"
+
+    # 群晖 Chat Webhook 支持多种格式，这里使用最简单的文本格式
+    payload = {
+        "text": full_message
+    }
+
+    # 如果支持更丰富的格式，可以使用 attachments
+    attachments_payload = {
+        "text": full_message,
+        "attachments": [
+            {
+                "title": title,
+                "text": message,
+                "color": level_info["color"],
+                "author_name": bot_name,
+                "author_icon": bot_avatar
+            }
+        ]
+    }
+
+    # 尝试两种格式
+    for payload_to_try in [attachments_payload, payload]:
+        for retry in range(max_retries + 1):
+            try:
+                timeout = aiohttp.ClientTimeout(total=15)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(webhook_url, json=payload_to_try, timeout=timeout) as response:
+                        if response.status in [200, 201, 204]:
+                            logger.debug(f"群晖 Chat 通知发送成功: {title}, 级别: {level}")
+                            return True
+                        else:
+                            response_text = await response.text()
+                            logger.warning(
+                                f"群晖 Chat 通知发送失败: HTTP {response.status}, 响应: {response_text[:100]}")
+
+                            if retry < max_retries:
+                                wait_time = 2 ** retry
+                                logger.info(f"等待 {wait_time} 秒后重试 ({retry + 1}/{max_retries})...")
+                                await asyncio.sleep(wait_time)
+                            else:
+                                return False
+            except asyncio.TimeoutError:
+                logger.warning(f"群晖 Chat 通知超时 ({retry + 1}/{max_retries + 1})")
+                if retry < max_retries:
+                    await asyncio.sleep(2 ** retry)
+            except aiohttp.ClientError as e:
+                logger.warning(f"群晖 Chat 通知网络错误: {e} ({retry + 1}/{max_retries + 1})")
+                if retry < max_retries:
+                    await asyncio.sleep(2 ** retry)
+            except Exception as e:
+                logger.error(f"发送群晖 Chat 通知时出错: {e}")
+                return False
+
+    return False
+
+
+async def send_synology_chat_notification(
+        title: str,
+        message: str,
+        level: str = "info",
+        webhook_url: str = None,
+        bot_name: str = None,
+        bot_avatar: str = None,
+        mention_users: list = None,
+        mention_channels: list = None
+) -> bool:
+    """发送群晖 Chat 通知（放入通知队列）"""
+    try:
+        # 将通知任务放入队列
+        await notify_queue.put({
+            'type': 'synology_chat_notification',
+            'title': title,
+            'message': message,
+            'level': level,
+            'webhook_url': webhook_url,
+            'bot_name': bot_name,
+            'bot_avatar': bot_avatar,
+            'mention_users': mention_users,
+            'mention_channels': mention_channels
+        })
+        logger.debug(f"已添加群晖 Chat 通知任务到队列: {title}, 级别: {level}")
+        return True
+    except asyncio.QueueFull:
+        logger.warning("通知队列已满，丢弃群晖 Chat 通知")
+        return False
+    except Exception as e:
+        logger.error(f"添加群晖 Chat 通知任务到队列失败: {e}")
+        return False
+
+
+
+
 async def notify_worker(worker_id: int):
     """通知队列的worker"""
     logger.debug(f"通知Worker {worker_id} 启动")
@@ -365,6 +686,7 @@ async def notify_worker(worker_id: int):
             task_type = task.get('type')
 
             if task_type == 'bark_notification':
+                # 处理 Bark 通知
                 title = task.get('title')
                 body = task.get('body')
                 url = task.get('url')
@@ -373,7 +695,6 @@ async def notify_worker(worker_id: int):
 
                 logger.debug(f"通知Worker {worker_id} 处理Bark通知: {title}, group={group}, level={level}")
 
-                # 实际发送通知
                 try:
                     success = await send_bark_notification_sync(title, body, url, group, level)
                     if success:
@@ -381,7 +702,34 @@ async def notify_worker(worker_id: int):
                     else:
                         logger.warning(f"通知Worker {worker_id}: {title} 发送失败")
                 except Exception as e:
-                    logger.error(f"通知Worker {worker_id} 发送通知时出错: {e}")
+                    logger.error(f"通知Worker {worker_id} 发送Bark通知时出错: {e}")
+                finally:
+                    notify_queue.task_done()
+
+            elif task_type == 'synology_chat_notification':
+                # 处理群晖 Chat 通知
+                title = task.get('title')
+                message = task.get('message')
+                level = task.get('level', 'info')
+                webhook_url = task.get('webhook_url')
+                bot_name = task.get('bot_name')
+                bot_avatar = task.get('bot_avatar')
+                mention_users = task.get('mention_users')
+                mention_channels = task.get('mention_channels')
+
+                logger.debug(f"通知Worker {worker_id} 处理群晖Chat通知: {title}, 级别: {level}")
+
+                try:
+                    success = await send_synology_chat_notification_sync(
+                        title, message, level, webhook_url, bot_name, bot_avatar,
+                        mention_users, mention_channels
+                    )
+                    if success:
+                        logger.debug(f"通知Worker {worker_id}: 群晖Chat通知 {title} 发送成功")
+                    else:
+                        logger.warning(f"通知Worker {worker_id}: 群晖Chat通知 {title} 发送失败")
+                except Exception as e:
+                    logger.error(f"通知Worker {worker_id} 发送群晖Chat通知时出错: {e}")
                 finally:
                     notify_queue.task_done()
 
@@ -405,63 +753,35 @@ async def notify_worker(worker_id: int):
 
 async def disk_space_monitor_task():
     """磁盘空间监控任务"""
-    # 首先检查是否启用通知
-    bark_config = getattr(app, 'bark_notification', {})
-    if not bark_config.get('enabled', False):
-        logger.info("Bark通知未启用，跳过磁盘空间监控任务")
+    # 检查是否启用通知
+    if not (notification_manager.bark_enabled or notification_manager.synology_chat_enabled):
+        logger.info("通知系统未启用，跳过磁盘空间监控任务")
         return
 
-    events_to_notify = bark_config.get('events_to_notify', [])
-    if not any(event in ['task_paused', 'disk_space'] for event in events_to_notify):
-        logger.info("磁盘空间相关通知未启用，跳过磁盘空间监控任务")
-        return
+    # 获取磁盘空间阈值
+    bark_threshold = notification_manager.bark_config.get('disk_space_threshold_gb', 10.0)
+    synology_threshold = notification_manager.synology_chat_config.get('disk_space_threshold_gb', 10.0)
+    # 使用最小的阈值
+    threshold_gb = min(bark_threshold, synology_threshold)
 
-    logger.info("磁盘空间监控任务已启动，将在启动时立即检查一次...")
+    # 获取检查间隔
+    bark_interval = notification_manager.bark_config.get('space_check_interval', 300)
+    synology_interval = notification_manager.synology_chat_config.get('space_check_interval', 300)
+    # 使用最小的间隔
+    check_interval = min(bark_interval, synology_interval)
+
+    logger.info(f"磁盘空间监控已启动，阈值: {threshold_gb}GB，检查间隔: {check_interval}秒")
 
     # 启动时立即执行一次检查
     try:
-        threshold_gb = bark_config.get('disk_space_threshold_gb', 10.0)
         has_space, available_gb, total_gb = await check_disk_space(threshold_gb)
-
-        if has_space:
-            message = (
-                f"✅ 磁盘空间监控启动\n"
-                f"可用空间: {available_gb}GB / {total_gb}GB\n"
-                f"阈值: {threshold_gb}GB\n"
-                f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            )
-            # 使用事件类型发送通知
-            success = await send_event_notification("disk_space", "磁盘空间监控启动", message)
-            if success:
-                logger.success("磁盘空间监控启动通知发送成功")
-            else:
-                logger.warning("磁盘空间监控启动通知发送失败")
-        else:
-            message = (
-                f"⚠️ 磁盘空间监控启动检测到空间不足\n"
-                f"可用空间: {available_gb}GB / {total_gb}GB\n"
-                f"阈值: {threshold_gb}GB\n"
-                f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            )
-            # 使用事件类型发送通知
-            success = await send_event_notification("disk_space", "磁盘空间警告", message)
-            if success:
-                logger.warning("磁盘空间警告通知发送成功")
-            else:
-                logger.warning("磁盘空间警告通知发送失败")
+        await notification_manager.send_disk_space_notification(has_space, available_gb, total_gb, threshold_gb)
     except Exception as e:
         logger.error(f"启动时磁盘空间检查失败: {e}")
-        # 不抛出异常，避免影响主程序运行
 
     # 开始定期检查
-    check_interval = bark_config.get('space_check_interval', 300)
-    logger.info(f"磁盘空间监控将每 {check_interval} 秒检查一次")
-
     while getattr(app, 'is_running', True):
         try:
-            threshold_gb = bark_config.get('disk_space_threshold_gb', 10.0)
-            check_interval = bark_config.get('space_check_interval', 300)
-
             await asyncio.sleep(check_interval)
 
             has_space, available_gb, total_gb = await check_disk_space(threshold_gb)
@@ -471,26 +791,16 @@ async def disk_space_monitor_task():
             if not has_space:
                 disk_monitor.space_low = True
                 if (current_time - disk_monitor.last_notification_time) > notification_cooldown:
-                    message = (
-                        f"⚠️ 磁盘空间不足\n"
-                        f"可用空间: {available_gb}GB / {total_gb}GB\n"
-                        f"阈值: {threshold_gb}GB\n"
-                        f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    await notification_manager.send_disk_space_notification(
+                        has_space, available_gb, total_gb, threshold_gb
                     )
-
-                    # 使用事件类型发送通知
-                    if await send_event_notification("disk_space", "磁盘空间警告", message):
-                        disk_monitor.last_notification_time = current_time
+                    disk_monitor.last_notification_time = current_time
             else:
                 if disk_monitor.space_low:
                     disk_monitor.space_low = False
-                    message = (
-                        f"✅ 磁盘空间已恢复\n"
-                        f"可用空间: {available_gb}GB / {total_gb}GB\n"
-                        f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    await notification_manager.send_disk_space_notification(
+                        has_space, available_gb, total_gb, threshold_gb
                     )
-                    # 使用事件类型发送通知
-                    await send_event_notification("disk_space", "磁盘空间恢复", message)
 
                     if disk_monitor.paused_workers:
                         logger.info("磁盘空间恢复，准备恢复下载任务...")
@@ -498,6 +808,103 @@ async def disk_space_monitor_task():
 
         except Exception as e:
             logger.error(f"磁盘空间监控任务出错: {e}")
+            await asyncio.sleep(60)
+
+
+async def stats_notification_task():
+    """定期统计信息通知任务"""
+    # 检查是否启用通知
+    if not notification_manager.should_notify("stats_summary"):
+        logger.info("统计摘要通知未启用，跳过统计通知任务")
+        return
+
+    logger.info("统计通知任务已启动")
+
+    # 启动时立即执行一次
+    try:
+        stats = await collect_stats_async()
+        if stats:
+            await notification_manager.send_stats_notification(stats)
+            logger.success("启动测试统计通知发送成功")
+        else:
+            logger.warning("收集统计信息失败，跳过启动测试通知")
+    except Exception as e:
+        logger.error(f"启动测试统计通知发送失败: {e}")
+
+    # 获取通知间隔
+    bark_interval = notification_manager.bark_config.get('stats_notification_interval', 3600)
+    global_interval = notification_manager.global_config.get('stats_notification_interval', 3600)
+    # 使用最短的间隔
+    interval = min(bark_interval, global_interval)
+
+    logger.info(f"统计通知任务将每 {interval} 秒执行一次")
+
+    while getattr(app, 'is_running', True):
+        try:
+            await asyncio.sleep(interval)
+
+            stats = await collect_stats_async()
+            if not stats:
+                logger.warning("收集统计信息失败，跳过本次通知")
+                continue
+
+            await notification_manager.send_stats_notification(stats)
+
+            # 重置统计
+            disk_monitor.stats_since_last_notification = {
+                "tasks_completed": 0,
+                "tasks_failed": 0,
+                "tasks_skipped": 0,
+                "download_size": 0
+            }
+        except Exception as e:
+            logger.error(f"统计通知任务出错: {e}")
+            await asyncio.sleep(60)
+
+
+async def queue_monitor_task():
+    """队列监控任务，检测队列长时间满载情况"""
+    # 检查是否启用通知
+    queue_status_enabled = notification_manager.should_notify("queue_status")
+    queue_full_enabled = notification_manager.should_notify("queue_full")
+
+    if not (queue_status_enabled or queue_full_enabled):
+        logger.info("队列通知未启用，跳过队列监控任务")
+        return
+
+    logger.info("队列监控任务已启动")
+
+    # 获取监控间隔
+    global_interval = notification_manager.global_config.get('queue_monitor_interval', 300)
+
+    while getattr(app, 'is_running', True):
+        try:
+            await asyncio.sleep(global_interval)
+
+            current_size = download_queue.qsize()
+            queue_capacity = queue_manager.download_batch_size
+            usage_percent = current_size / queue_capacity if queue_capacity > 0 else 0
+
+            # 如果队列使用率超过80%，发送状态报告
+            if usage_percent > 0.8 and queue_status_enabled:
+                active_workers = 0
+                for _, value in app.chat_download_config.items():
+                    if value.node and value.node.download_status:
+                        active_workers += sum(1 for status in value.node.download_status.values()
+                                              if status == DownloadStatus.Downloading)
+
+                message = (
+                    f"📊 队列状态报告\n"
+                    f"队列使用率: {current_size}/{queue_capacity} ({int(usage_percent * 100)}%)\n"
+                    f"活动worker数: {active_workers}\n"
+                    f"暂停worker数: {len(disk_monitor.paused_workers)}\n"
+                    f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+
+                await notification_manager.send_event_notification("queue_status", "队列状态", message, "info")
+
+        except Exception as e:
+            logger.error(f"队列监控任务出错: {e}")
             await asyncio.sleep(60)
 
 
@@ -1058,25 +1465,14 @@ async def add_download_task(
             if current_wait_time > max_wait_time:
                 current_time = time.time()
                 if current_time - last_notification_time > notification_interval:
-                    bark_config = getattr(app, 'bark_notification', {})
-                    events_to_notify = bark_config.get('events_to_notify', [])
-
-                    if 'queue_full' in events_to_notify:
-                        message_body = (
-                            f"⚠️ 下载队列长时间满载\n"
-                            f"消息ID: {message.id}\n"
-                            f"聊天ID: {node.chat_id}\n"
-                            f"队列容量: {queue_capacity}\n"
-                            f"当前队列: {current_size}\n"
-                            f"已等待: {int(current_wait_time / 60)}分钟\n"
-                            f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                        )
-                        # 使用事件类型发送通知
-                        await send_event_notification("queue_full", "队列满载告警", message_body)
+                    # 发送队列满载通知
+                    wait_minutes = int(current_wait_time / 60)
+                    await notification_manager.send_queue_notification(
+                        current_size, queue_capacity, wait_minutes
+                    )
 
                     last_notification_time = current_time
-                    logger.warning(
-                        f"任务添加等待时间过长: message_id={message.id}, 已等待{int(current_wait_time / 60)}分钟")
+                    logger.warning(f"任务添加等待时间过长: message_id={message.id}, 已等待{wait_minutes}分钟")
 
             # 等待一段时间再检查
             await asyncio.sleep(1)
@@ -1964,33 +2360,43 @@ def print_config_summary(app):
 def check_config_consistency(app):
     """检查配置一致性"""
     issues = []
-    
+
     # 检查API配置
     if not app.api_id or not app.api_hash:
         issues.append("API ID或API Hash未设置")
-    
+
     # 检查下载路径
     if not os.path.exists(app.save_path):
         logger.warning(f"下载路径不存在: {app.save_path}")
         issues.append(f"下载路径不存在: {app.save_path}")
-    
+
     # 检查媒体类型
     if not app.media_types:
         issues.append("媒体类型未设置")
-    
+
     # 检查文件格式
     if not app.file_formats:
         issues.append("文件格式未设置")
-    
+
     # 检查聊天配置
     if not app.chat_download_config:
         issues.append("聊天配置为空")
-    
-    # 检查Bark配置（如果启用）
-    if hasattr(app, 'bark_notification') and app.bark_notification.get('enabled', False):
-        if not app.bark_notification.get('url'):
+
+    # 检查通知配置
+    notifications_config = getattr(app, 'notifications', {})
+
+    # 检查 Bark 配置
+    bark_config = notifications_config.get('bark', {})
+    if bark_config.get('enabled', False):
+        if not bark_config.get('url'):
             issues.append("Bark通知已启用但URL未设置")
-    
+
+    # 检查群晖 Chat 配置
+    synology_config = notifications_config.get('synology_chat', {})
+    if synology_config.get('enabled', False):
+        if not synology_config.get('webhook_url'):
+            issues.append("群晖Chat通知已启用但Webhook URL未设置")
+
     return issues
 
 
@@ -2087,6 +2493,9 @@ def main():
         # 更新队列管理器配置
         queue_manager.update_limits()
 
+        # 加载通知管理器配置
+        notification_manager.load_config()
+
         # 设置全局异常处理器
         def global_exception_handler(loop, context):
             exception = context.get('exception')
@@ -2115,7 +2524,7 @@ def main():
         download_tasks = app.loop.run_until_complete(start_download_workers(client))
 
         # 启动监控任务
-        if hasattr(app, 'bark_notification') and app.bark_notification.get('enabled', False):
+        if notification_manager.bark_enabled or notification_manager.synology_chat_enabled:
             # 启动磁盘空间监控
             disk_monitor_task_obj = app.loop.create_task(disk_space_monitor_task())
             monitor_tasks.append(disk_monitor_task_obj)
@@ -2128,76 +2537,62 @@ def main():
             queue_monitor_obj = app.loop.create_task(queue_monitor_task())
             monitor_tasks.append(queue_monitor_obj)
 
-            logger.info("磁盘空间监控、统计通知和队列监控已启用")
+            logger.info("通知系统已启用，监控任务已启动")
 
-            # 在启动后立即测试通知功能
-            async def test_all_notifications():
+            # 测试通知功能
+            async def test_notifications():
                 """测试所有通知功能"""
-                logger.info("开始测试所有通知功能...")
+                logger.info("开始测试通知功能...")
 
                 # 测试基本通知
-                test_success = await send_event_notification("test", "测试通知", "Telegram媒体下载器启动测试成功！")
-                if test_success:
-                    logger.success("基本通知测试成功")
-                else:
-                    logger.warning("基本通知测试失败")
+                test_results = await notification_manager.send_test_notification()
 
-                # 等待一会儿，避免通知过于密集
-                await asyncio.sleep(1)
+                # 如果有任何一种通知方式成功，就测试磁盘空间检查
+                if test_results.get('bark') or test_results.get('synology_chat'):
+                    try:
+                        # 获取磁盘空间信息
+                        threshold_gb = 10.0
+                        has_space, available_gb, total_gb = await check_disk_space(threshold_gb)
 
-                # 测试磁盘空间检查通知
-                try:
-                    threshold_gb = app.bark_notification.get('disk_space_threshold_gb', 10.0)
-                    has_space, available_gb, total_gb = await check_disk_space(threshold_gb)
-
-                    if has_space:
-                        test_msg = f"磁盘空间检查测试：可用 {available_gb}GB，充足"
-                    else:
-                        test_msg = f"磁盘空间检查测试：可用 {available_gb}GB，不足"
-
-                    test_success = await send_event_notification("test", "磁盘空间测试", test_msg)
-                    if test_success:
-                        logger.success("磁盘空间检查测试成功")
-                    else:
-                        logger.warning("磁盘空间检查测试失败")
-                except Exception as e:
-                    logger.error(f"磁盘空间检查测试失败: {e}")
+                        # 发送磁盘空间测试通知
+                        await notification_manager.send_disk_space_notification(
+                            has_space, available_gb, total_gb, threshold_gb
+                        )
+                        logger.info("磁盘空间检查测试完成")
+                    except Exception as e:
+                        logger.error(f"磁盘空间检查测试失败: {e}")
 
                 logger.info("通知功能测试完成")
 
             # 运行测试
-            app.loop.create_task(test_all_notifications())
+            app.loop.create_task(test_notifications())
         else:
-            logger.info("Bark通知未启用，跳过监控任务")
+            logger.info("所有通知方式均未启用，跳过监控任务")
 
         # 发送启动通知
-        # 在 main 函数中找到启动通知部分，修改为：
-        if hasattr(app, 'bark_notification') and app.bark_notification.get('enabled', False):
-            events_to_notify = app.bark_notification.get('events_to_notify', [])
-            if 'startup' in events_to_notify:
-                # 异步获取失败任务数
-                async def get_total_failed_tasks():
-                    total = 0
-                    for chat_id, _ in app.chat_download_config.items():
-                        failed_tasks = await load_failed_tasks(chat_id)
-                        total += len(failed_tasks)
-                    return total
+        async def send_startup_notification():
+            """发送启动通知"""
+            try:
+                # 获取失败任务数
+                total_failed_tasks = 0
+                for chat_id, _ in app.chat_download_config.items():
+                    failed_tasks = await load_failed_tasks(chat_id)
+                    total_failed_tasks += len(failed_tasks)
+            except:
+                total_failed_tasks = 0
 
-                try:
-                    total_failed_tasks = run_async_sync(get_total_failed_tasks(), timeout=30)
-                except:
-                    total_failed_tasks = 0
+            startup_title = "程序启动"
+            startup_message = (
+                f"✅ Telegram媒体下载器已启动\n"
+                f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"下载worker: {queue_manager.max_download_tasks}\n"
+                f"配置聊天数: {len(app.chat_download_config)}\n"
+                f"待重试失败任务: {total_failed_tasks}"
+            )
 
-                startup_msg = (
-                    f"✅ Telegram媒体下载器已启动\n"
-                    f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"下载worker: {queue_manager.max_download_tasks}\n"
-                    f"配置聊天数: {len(app.chat_download_config)}\n"
-                    f"待重试失败任务: {total_failed_tasks}"
-                )
+            await notification_manager.send_event_notification("startup", startup_title, startup_message)
 
-                # 使用事件类型发送通知
-                app.loop.create_task(send_event_notification("startup", "程序启动", startup_msg))
+        app.loop.create_task(send_startup_notification())
 
         app.loop.create_task(download_all_chat(client))
 
@@ -2248,6 +2643,23 @@ def main():
             logger.success(f"{_t('Updated last read message_id to config file')}")
         except Exception as e:
             logger.error(f"保存配置时出错: {e}")
+
+        # 发送关闭通知
+        async def send_shutdown_notification():
+            shutdown_title = "程序停止"
+            shutdown_message = (
+                f"🛑 Telegram媒体下载器已停止\n"
+                f"停止时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"下载队列剩余: {download_queue.qsize()}\n"
+                f"通知队列剩余: {notify_queue.qsize()}"
+            )
+
+            await notification_manager.send_event_notification("shutdown", shutdown_title, shutdown_message)
+
+        try:
+            app.loop.run_until_complete(send_shutdown_notification())
+        except Exception as e:
+            logger.error(f"发送停止通知失败: {e}")
 
         if app.bot_token:
             try:
