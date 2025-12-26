@@ -166,32 +166,33 @@ DATA_FILE_NAME = "data.yaml"
 APPLICATION_NAME = "media_downloader"
 app = Application(CONFIG_NAME, DATA_FILE_NAME, APPLICATION_NAME)
 
-# 分离两个队列
-download_queue: asyncio.Queue = asyncio.Queue(maxsize=100)  # 限制下载队列大小
-notify_queue: asyncio.Queue = asyncio.Queue(maxsize=100)    # 通知队列
-
 # 队列管理器
 class QueueManager:
     def __init__(self):
         self.max_download_tasks = 0
         self.max_notify_tasks = 1  # 默认1个通知worker
-        self.download_batch_size = 0
+        self.download_queue_size = 0  # 下载队列大小
         self.task_added = 0
         self.task_processed = 0
         self.lock = asyncio.Lock()
-        
+
     def update_limits(self):
         """更新队列限制"""
         self.max_download_tasks = getattr(app, 'max_download_task', 5)
         # 从配置读取通知worker数量
         bark_config = getattr(app, 'bark_notification', {})
         self.max_notify_tasks = bark_config.get('notify_worker_count', 1)
-        # 每次批量添加的任务数 = worker数量 * 2
-        self.download_batch_size = self.max_download_tasks * 2
+        # 下载队列大小 = worker数量（而不是二倍）
+        self.download_queue_size = self.max_download_tasks
         logger.info(f"队列管理器初始化: 下载worker={self.max_download_tasks}, "
-                   f"通知worker={self.max_notify_tasks}, 批量大小={self.download_batch_size}")
+                    f"通知worker={self.max_notify_tasks}, 下载队列大小={self.download_queue_size}")
 
 queue_manager = QueueManager()
+
+# 在main函数中会重新初始化队列
+download_queue: asyncio.Queue = None
+notify_queue: asyncio.Queue = None
+
 RETRY_TIME_OUT = 3
 
 logging.getLogger("pyrogram.session.session").addFilter(LogFilter())
@@ -496,14 +497,17 @@ async def send_bark_notification_sync(
 
 
 async def send_bark_notification(
-    title: str,
-    body: str,
-    url: str = None,
-    group: str = None,
-    level: str = None
+        title: str,
+        body: str,
+        url: str = None,
+        group: str = None,
+        level: str = None
 ):
-    """发送Bark通知（放入通知队列），支持分组和级别"""
+    """发送Bark通知（放入通知队列），添加时间戳"""
     try:
+        # 添加创建时间戳
+        create_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
         # 将通知任务放入队列
         await notify_queue.put({
             'type': 'bark_notification',
@@ -511,9 +515,11 @@ async def send_bark_notification(
             'body': body,
             'url': url,
             'group': group,
-            'level': level
+            'level': level,
+            'create_time': create_time,  # 添加创建时间
+            'queue_time': time.time()  # 添加队列时间戳（Unix时间）
         })
-        logger.debug(f"已添加通知任务到队列: {title}, group={group}, level={level}")
+        logger.debug(f"已添加通知任务到队列: {title}, 创建时间={create_time}")
         return True
     except asyncio.QueueFull:
         logger.warning("通知队列已满，丢弃通知")
@@ -679,8 +685,11 @@ async def send_synology_chat_notification(
         mention_users: list = None,
         mention_channels: list = None
 ) -> bool:
-    """发送群晖 Chat 通知（放入通知队列）"""
+    """发送群晖 Chat 通知（放入通知队列），添加时间戳"""
     try:
+        # 添加创建时间戳
+        create_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
         # 将通知任务放入队列
         await notify_queue.put({
             'type': 'synology_chat_notification',
@@ -691,9 +700,11 @@ async def send_synology_chat_notification(
             'bot_name': bot_name,
             'bot_avatar': bot_avatar,
             'mention_users': mention_users,
-            'mention_channels': mention_channels
+            'mention_channels': mention_channels,
+            'create_time': create_time,  # 添加创建时间
+            'queue_time': time.time()  # 添加队列时间戳
         })
-        logger.debug(f"已添加群晖 Chat 通知任务到队列: {title}, 级别: {level}")
+        logger.debug(f"已添加群晖 Chat 通知任务到队列: {title}, 创建时间={create_time}")
         return True
     except asyncio.QueueFull:
         logger.warning("通知队列已满，丢弃群晖 Chat 通知")
@@ -703,10 +714,8 @@ async def send_synology_chat_notification(
         return False
 
 
-
-
 async def notify_worker(worker_id: int):
-    """通知队列的worker"""
+    """通知队列的worker，添加延迟监控"""
     logger.debug(f"通知Worker {worker_id} 启动")
 
     while getattr(app, 'is_running', True) and not getattr(app, 'force_exit', False):
@@ -718,6 +727,18 @@ async def notify_worker(worker_id: int):
                 continue
 
             task_type = task.get('type')
+            create_time = task.get('create_time', '未知')
+            queue_time = task.get('queue_time', time.time())
+
+            # 计算延迟时间
+            current_time = time.time()
+            delay_seconds = current_time - queue_time
+
+            # 记录延迟情况
+            if delay_seconds > 10:  # 延迟超过10秒警告
+                logger.warning(f"通知Worker {worker_id}: 任务延迟 {delay_seconds:.1f} 秒, 创建时间={create_time}")
+            elif delay_seconds > 60:  # 延迟超过1分钟严重警告
+                logger.error(f"通知Worker {worker_id}: 任务严重延迟 {delay_seconds:.1f} 秒, 创建时间={create_time}")
 
             if task_type == 'bark_notification':
                 # 处理 Bark 通知
@@ -727,16 +748,16 @@ async def notify_worker(worker_id: int):
                 group = task.get('group')
                 level = task.get('level')
 
-                logger.debug(f"通知Worker {worker_id} 处理Bark通知: {title}, group={group}, level={level}")
+                logger.debug(f"通知Worker {worker_id} 处理Bark通知: {title}, 延迟={delay_seconds:.1f}秒")
 
                 try:
                     success = await send_bark_notification_sync(title, body, url, group, level)
                     if success:
-                        logger.debug(f"通知Worker {worker_id}: {title} 发送成功")
+                        logger.debug(f"通知Worker {worker_id}: {title} 发送成功, 总延迟={delay_seconds:.1f}秒")
                     else:
-                        logger.warning(f"通知Worker {worker_id}: {title} 发送失败")
+                        logger.warning(f"通知Worker {worker_id}: {title} 发送失败, 延迟={delay_seconds:.1f}秒")
                 except Exception as e:
-                    logger.error(f"通知Worker {worker_id} 发送Bark通知时出错: {e}")
+                    logger.error(f"通知Worker {worker_id} 发送Bark通知时出错: {e}, 延迟={delay_seconds:.1f}秒")
                 finally:
                     notify_queue.task_done()
 
@@ -751,7 +772,7 @@ async def notify_worker(worker_id: int):
                 mention_users = task.get('mention_users')
                 mention_channels = task.get('mention_channels')
 
-                logger.debug(f"通知Worker {worker_id} 处理群晖Chat通知: {title}, 级别: {level}")
+                logger.debug(f"通知Worker {worker_id} 处理群晖Chat通知: {title}, 延迟={delay_seconds:.1f}秒")
 
                 try:
                     success = await send_synology_chat_notification_sync(
@@ -759,11 +780,13 @@ async def notify_worker(worker_id: int):
                         mention_users, mention_channels
                     )
                     if success:
-                        logger.debug(f"通知Worker {worker_id}: 群晖Chat通知 {title} 发送成功")
+                        logger.debug(
+                            f"通知Worker {worker_id}: 群晖Chat通知 {title} 发送成功, 延迟={delay_seconds:.1f}秒")
                     else:
-                        logger.warning(f"通知Worker {worker_id}: 群晖Chat通知 {title} 发送失败")
+                        logger.warning(
+                            f"通知Worker {worker_id}: 群晖Chat通知 {title} 发送失败, 延迟={delay_seconds:.1f}秒")
                 except Exception as e:
-                    logger.error(f"通知Worker {worker_id} 发送群晖Chat通知时出错: {e}")
+                    logger.error(f"通知Worker {worker_id} 发送群晖Chat通知时出错: {e}, 延迟={delay_seconds:.1f}秒")
                 finally:
                     notify_queue.task_done()
 
@@ -916,7 +939,7 @@ async def queue_monitor_task():
             await asyncio.sleep(global_interval)
 
             current_size = download_queue.qsize()
-            queue_capacity = queue_manager.download_batch_size
+            queue_capacity = queue_manager.download_queue_size
             usage_percent = current_size / queue_capacity if queue_capacity > 0 else 0
 
             # 如果队列使用率超过80%，发送状态报告
@@ -942,100 +965,6 @@ async def queue_monitor_task():
             await asyncio.sleep(60)
 
 
-async def stats_notification_task():
-    """定期统计信息通知任务"""
-    # 首先检查是否启用通知
-    bark_config = getattr(app, 'bark_notification', {})
-    if not bark_config.get('enabled', False):
-        logger.info("Bark通知未启用，跳过统计通知任务")
-        return
-
-    events_to_notify = bark_config.get('events_to_notify', [])
-    if 'stats_summary' not in events_to_notify:
-        logger.info("统计摘要通知未启用，跳过统计通知任务")
-        return
-
-    logger.info("统计通知任务已启动，将在启动时立即执行一次...")
-
-    # 启动时立即执行一次
-    try:
-        stats = await collect_stats_async()
-        if stats:
-            message = (
-                f"📊 统计摘要（启动测试）\n"
-                f"运行时间: {stats['uptime']}\n"
-                f"完成任务: {stats['tasks_completed']}\n"
-                f"失败任务(待重试): {stats.get('failed_tasks_pending', 0)}\n"
-                f"下载大小: {stats['download_size_mb']:.2f}MB\n"
-                f"磁盘可用: {stats['disk_available_gb']:.2f}GB/{stats['disk_total_gb']:.2f}GB\n"
-                f"活动任务: {stats['active_tasks']}\n"
-                f"队列任务: {stats['queued_tasks']}\n"
-                f"空间不足: {'是' if stats['space_low'] else '否'}\n"
-                f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            )
-
-            # 使用事件类型发送通知
-            success = await send_event_notification("stats_summary", "启动测试通知", message)
-            if success:
-                logger.success("启动测试通知发送成功")
-            else:
-                logger.warning("启动测试通知发送失败")
-        else:
-            logger.warning("收集统计信息失败，跳过启动测试通知")
-    except Exception as e:
-        logger.error(f"启动测试通知发送失败: {e}")
-        # 不抛出异常，避免影响主程序运行
-
-    # 重置统计
-    disk_monitor.stats_since_last_notification = {
-        "tasks_completed": 0,
-        "tasks_failed": 0,
-        "tasks_skipped": 0,
-        "download_size": 0
-    }
-
-    # 开始定期执行
-    interval = bark_config.get('stats_notification_interval', 3600)
-    logger.info(f"统计通知任务将每 {interval} 秒执行一次")
-
-    while getattr(app, 'is_running', True):
-        try:
-            await asyncio.sleep(interval)
-
-            stats = await collect_stats_async()
-            if not stats:
-                logger.warning("收集统计信息失败，跳过本次通知")
-                continue
-
-            # 构建更详细的消息
-            message = (
-                f"📊 统计摘要\n"
-                f"运行时间: {stats['uptime']}\n"
-                f"完成任务: {stats['tasks_completed']}\n"
-                f"失败任务(待重试): {stats.get('failed_tasks_pending', 0)}\n"
-                f"下载大小: {stats['download_size_mb']:.2f}MB\n"
-                f"磁盘可用: {stats['disk_available_gb']:.2f}GB/{stats['disk_total_gb']:.2f}GB\n"
-                f"活动任务: {stats['active_tasks']}\n"
-                f"队列任务: {stats['queued_tasks']}\n"
-                f"空间不足: {'是' if stats['space_low'] else '否'}\n"
-                f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            )
-
-            # 使用事件类型发送通知
-            await send_event_notification("stats_summary", "下载统计", message)
-
-            # 重置统计
-            disk_monitor.stats_since_last_notification = {
-                "tasks_completed": 0,
-                "tasks_failed": 0,
-                "tasks_skipped": 0,
-                "download_size": 0
-            }
-        except Exception as e:
-            logger.error(f"统计通知任务出错: {e}")
-            await asyncio.sleep(60)
-
-
 def run_async_sync(coroutine, loop=None, timeout=10):
     """同步运行异步函数"""
     if loop is None:
@@ -1051,7 +980,6 @@ def run_async_sync(coroutine, loop=None, timeout=10):
         return loop.run_until_complete(coroutine)
 
 
-# 然后在需要的地方使用这个辅助函数
 async def collect_stats_async() -> Dict[str, Any]:
     """异步收集统计信息"""
     try:
@@ -1141,18 +1069,22 @@ def setup_exit_signal_handlers():
 
 
 async def graceful_shutdown():
-    """优雅关闭所有组件"""
+    """优雅关闭所有组件，确保发送关闭通知"""
     logger.info("开始优雅关闭...")
+
+    # 记录开始关闭时间
+    shutdown_start_time = time.time()
 
     # 1. 停止添加新任务
     if hasattr(app, 'is_running'):
         app.is_running = False
 
-    # 2. 等待当前处理的任务完成（最多10秒）
+    # 2. 等待当前处理的任务完成（最多30秒）
     logger.info("等待当前任务完成...")
     wait_start = time.time()
+    max_wait_time = 30
 
-    while time.time() - wait_start < 10:
+    while time.time() - wait_start < max_wait_time:
         # 检查是否还有任务在处理
         active_tasks = 0
         for _, value in app.chat_download_config.items():
@@ -1160,50 +1092,88 @@ async def graceful_shutdown():
                 active_tasks += sum(1 for status in value.node.download_status.values()
                                     if status == DownloadStatus.Downloading)
 
-        if active_tasks == 0:
+        if active_tasks == 0 and download_queue.empty():
             logger.info("所有活动任务已完成")
             break
 
-        logger.debug(f"还有 {active_tasks} 个任务在处理中...")
+        if time.time() - wait_start > 10:  # 每10秒报告一次
+            logger.info(f"还有 {active_tasks} 个活动任务和 {download_queue.qsize()} 个队列任务在处理中...")
+            wait_start = time.time()  # 重置计时器，避免频繁报告
+
         await asyncio.sleep(1)
 
     # 3. 发送关闭通知（如果启用）
-    if hasattr(app, 'bark_notification') and app.bark_notification.get('enabled', False):
-        events_to_notify = app.bark_notification.get('events_to_notify', [])
-        if 'shutdown' in events_to_notify:
-            try:
-                shutdown_msg = (
-                    f"🛑 Telegram媒体下载器已停止\n"
-                    f"停止时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"下载队列剩余: {download_queue.qsize()}\n"
-                    f"通知队列剩余: {notify_queue.qsize()}"
-                )
-                await send_bark_notification("程序停止", shutdown_msg)
-            except Exception as e:
-                logger.error(f"发送停止通知失败: {e}")
+    try:
+        # 收集统计信息
+        try:
+            stats = await collect_stats_async()
+        except:
+            stats = {}
+
+        # 构建关闭消息
+        shutdown_msg = (
+            f"🛑 Telegram媒体下载器已停止\n"
+            f"停止时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"运行时间: {stats.get('uptime', 'N/A') if stats else 'N/A'}\n"
+            f"完成任务: {stats.get('tasks_completed', 0) if stats else 0}\n"
+            f"下载队列剩余: {download_queue.qsize()}\n"
+            f"通知队列剩余: {notify_queue.qsize()}\n"
+            f"关闭耗时: {time.time() - shutdown_start_time:.1f}秒"
+        )
+
+        # 发送关闭通知
+        if notification_manager.bark_enabled or notification_manager.synology_chat_enabled:
+            logger.info("发送关闭通知...")
+            # 同步发送通知，确保在退出前发送
+            success = await notification_manager.send_event_notification(
+                "shutdown",
+                "程序停止",
+                shutdown_msg,
+                level="active"  # 活跃通知，确保用户看到
+            )
+
+            if success:
+                logger.info("关闭通知发送成功")
+            else:
+                logger.warning("关闭通知发送失败")
+
+            # 额外等待2秒，确保通知发送完成
+            await asyncio.sleep(2)
+    except Exception as e:
+        logger.error(f"发送停止通知失败: {e}")
 
     # 4. 清空队列
     logger.info("清空队列...")
     try:
+        # 记录清空前队列状态
+        download_queue_size_before = download_queue.qsize() if hasattr(download_queue, 'qsize') else 0
+        notify_queue_size_before = notify_queue.qsize() if hasattr(notify_queue, 'qsize') else 0
+
         # 清空下载队列
+        cleared_download = 0
         while not download_queue.empty():
             try:
                 download_queue.get_nowait()
                 download_queue.task_done()
+                cleared_download += 1
             except (asyncio.QueueEmpty, ValueError):
                 break
 
         # 清空通知队列
+        cleared_notify = 0
         while not notify_queue.empty():
             try:
                 notify_queue.get_nowait()
                 notify_queue.task_done()
+                cleared_notify += 1
             except (asyncio.QueueEmpty, ValueError):
                 break
+
+        logger.info(f"队列已清空: 下载队列清除了 {cleared_download} 个任务, 通知队列清除了 {cleared_notify} 个任务")
     except Exception as e:
         logger.error(f"清空队列时出错: {e}")
 
-    logger.info("优雅关闭完成")
+    logger.info(f"优雅关闭完成，总耗时: {time.time() - shutdown_start_time:.1f}秒")
 
 
 async def run_until_all_task_finish():
@@ -1392,18 +1362,18 @@ async def _get_media_meta(
         file_format: Optional[str] = media_obj.mime_type.split("/")[-1]
     else:
         file_format = None
-    
+
     file_name = None
     temp_file_name = None
     dirname = validate_title(f"{chat_id}")
     if message.chat and message.chat.title:
         dirname = validate_title(f"{message.chat.title}")
-    
+
     if message.date:
         datetime_dir_name = message.date.strftime(app.date_format)
     else:
         datetime_dir_name = "0"
-    
+
     if _type in ["voice", "video_note"]:
         file_format = media_obj.mime_type.split("/")[-1]
         file_save_path = app.get_file_save_path(_type, dirname, datetime_dir_name)
@@ -1419,7 +1389,7 @@ async def _get_media_meta(
     else:
         file_name = getattr(media_obj, "file_name", None)
         caption = getattr(message, "caption", None)
-        
+
         file_name_suffix = ".unknown"
         if not file_name:
             file_name_suffix = get_extension(
@@ -1432,7 +1402,7 @@ async def _get_media_meta(
                 file_name_suffix = get_extension(
                     media_obj.file_id, getattr(media_obj, "mime_type", "")
                 )
-        
+
         if caption:
             caption = validate_title(caption)
             app.set_caption_name(chat_id, message.media_group_id, caption)
@@ -1441,18 +1411,18 @@ async def _get_media_meta(
             )
         else:
             caption = app.get_caption_name(chat_id, message.media_group_id)
-        
+
         if not file_name and message.photo:
             file_name = f"{message.photo.file_unique_id}"
-        
+
         gen_file_name = (
                 app.get_file_name(message.id, file_name, caption) + file_name_suffix
         )
-        
+
         file_save_path = app.get_file_save_path(_type, dirname, datetime_dir_name)
         temp_file_name = os.path.join(app.temp_save_path, dirname, gen_file_name)
         file_name = os.path.join(file_save_path, gen_file_name)
-    
+
     return truncate_filename(file_name), truncate_filename(temp_file_name), file_format
 
 
@@ -1473,7 +1443,7 @@ async def add_download_task(
         try:
             # 检查队列是否有空位
             current_size = download_queue.qsize()
-            queue_capacity = queue_manager.download_batch_size
+            queue_capacity = queue_manager.download_queue_size  # 使用新的队列大小
 
             if current_size < queue_capacity:
                 # 有空位，添加任务
@@ -1583,22 +1553,22 @@ async def save_msg_to_file(
         message.chat.title if message.chat and message.chat.title else str(chat_id)
     )
     datetime_dir_name = message.date.strftime(app.date_format) if message.date else "0"
-    
+
     file_save_path = app.get_file_save_path("msg", dirname, datetime_dir_name)
     file_name = os.path.join(
         app.temp_save_path,
         file_save_path,
         f"{app.get_file_name(message.id, None, None)}.txt",
     )
-    
+
     os.makedirs(os.path.dirname(file_name), exist_ok=True)
-    
+
     if _is_exist(file_name):
         return DownloadStatus.SkipDownload, None
-    
+
     with open(file_name, "w", encoding="utf-8") as f:
         f.write(message.text or "")
-    
+
     return DownloadStatus.SuccessDownload, file_name
 
 
@@ -2018,7 +1988,7 @@ async def download_chat_task(
 
     # 主消息迭代器处理（带流控）
     batch_messages = []
-    batch_size = queue_manager.download_batch_size
+    batch_size = queue_manager.download_queue_size  # 使用队列大小作为批量大小
 
     async for message in messages_iter:
         meta_data = MetaData()
@@ -2042,7 +2012,7 @@ async def download_chat_task(
 
             # 当收集到足够的消息时，批量添加
             if len(batch_messages) >= batch_size:
-                added = await add_download_task_batch(batch_messages, node, batch_size)
+                added = await add_download_task_batch(batch_messages, node, min(batch_size, len(batch_messages)))
                 batch_messages = []
 
                 if node.total_task % 100 == 0:
@@ -2183,6 +2153,54 @@ async def run_until_all_task_finish():
     logger.info("主运行循环结束")
 
 
+async def retry_failed_tasks(
+        client: pyrogram.Client,
+        chat_id: Union[int, str],
+        node: TaskNode,
+        max_batch: int = None
+) -> Tuple[int, int]:
+    """重试失败的任务"""
+    if max_batch is None:
+        max_batch = queue_manager.max_download_tasks  # 使用worker数量作为批量大小
+
+    failed_tasks = await load_failed_tasks(chat_id)
+    if not failed_tasks:
+        return 0, 0
+
+    # 获取要重试的消息
+    message_ids = [task['message_id'] for task in failed_tasks[:max_batch]]
+
+    if not message_ids:
+        return 0, 0
+
+    try:
+        messages = await client.get_messages(chat_id=chat_id, message_ids=message_ids)
+
+        # 过滤掉None消息（可能已经被删除）
+        valid_messages = [msg for msg in messages if msg is not None]
+
+        if not valid_messages:
+            logger.warning(f"聊天 {chat_id} 的失败任务消息已不存在，清理失败列表")
+            # 清理不存在的消息
+            for task in failed_tasks[:max_batch]:
+                await remove_failed_task(chat_id, task['message_id'])
+            return len(failed_tasks[:max_batch]), 0
+
+        # 添加到下载队列
+        added = await add_download_task_batch(valid_messages, node, len(valid_messages))
+
+        if added > 0:
+            logger.info(f"已为聊天 {chat_id} 重试 {added}/{len(valid_messages)} 个失败任务")
+        else:
+            logger.warning(f"聊天 {chat_id} 的失败任务重试添加失败")
+
+        return len(failed_tasks[:max_batch]), added
+
+    except Exception as e:
+        logger.error(f"重试失败任务时出错: {e}")
+        return len(failed_tasks[:max_batch]), 0
+
+
 def _exec_loop():
     """执行循环"""
     app.loop.run_until_complete(run_until_all_task_finish())
@@ -2201,24 +2219,24 @@ async def stop_server(client: pyrogram.Client):
 async def start_notify_workers():
     """启动通知worker"""
     notify_tasks = []
-    
+
     for i in range(queue_manager.max_notify_tasks):
         task = app.loop.create_task(notify_worker(i + 1))
         notify_tasks.append(task)
         logger.debug(f"启动通知Worker {i + 1}/{queue_manager.max_notify_tasks}")
-    
+
     return notify_tasks
 
 
 async def start_download_workers(client: pyrogram.Client):
     """启动下载worker"""
     download_tasks = []
-    
+
     for i in range(queue_manager.max_download_tasks):
         task = app.loop.create_task(download_worker(client, i + 1))
         download_tasks.append(task)
         logger.debug(f"启动下载Worker {i + 1}/{queue_manager.max_download_tasks}")
-    
+
     return download_tasks
 
 
@@ -2476,45 +2494,6 @@ def check_config_consistency(app):
     return issues
 
 
-async def queue_monitor_task():
-    """队列监控任务，检测队列长时间满载情况"""
-    while getattr(app, 'is_running', True):
-        try:
-            # 每5分钟检查一次
-            await asyncio.sleep(300)
-
-            bark_config = getattr(app, 'bark_notification', {})
-            events_to_notify = bark_config.get('events_to_notify', [])
-
-            # 检查队列状态报告
-            if 'queue_status' in events_to_notify:
-                current_size = download_queue.qsize()
-                queue_capacity = queue_manager.download_batch_size
-
-                # 如果队列长时间满载（超过80%容量），发送状态报告
-                if current_size > queue_capacity * 0.8:
-                    active_workers = 0
-                    for _, value in app.chat_download_config.items():
-                        if value.node and value.node.download_status:
-                            active_workers += sum(1 for status in value.node.download_status.values()
-                                                  if status == DownloadStatus.Downloading)
-
-                    message = (
-                        f"📊 队列状态报告\n"
-                        f"队列使用率: {current_size}/{queue_capacity} ({int(current_size / queue_capacity * 100)}%)\n"
-                        f"活动worker数: {active_workers}\n"
-                        f"暂停worker数: {len(disk_monitor.paused_workers)}\n"
-                        f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                    )
-
-                    # 使用事件类型发送通知
-                    await send_event_notification("queue_status", "队列状态", message)
-
-        except Exception as e:
-            logger.error(f"队列监控任务出错: {e}")
-            await asyncio.sleep(60)
-
-
 async def send_event_notification(event_type: str, title: str, body: str, custom_group: str = None,
                                   custom_level: str = None):
     """发送事件通知，根据事件类型使用不同的分组和级别"""
@@ -2568,6 +2547,13 @@ def main():
 
         # 更新队列管理器配置
         queue_manager.update_limits()
+
+        # 重新初始化队列大小（确保在更新限制后）
+        global download_queue, notify_queue
+        download_queue = asyncio.Queue(maxsize=queue_manager.download_queue_size)
+        notify_queue = asyncio.Queue(maxsize=100)
+
+        logger.info(f"下载队列大小已设置为: {queue_manager.download_queue_size}")
 
         # 加载通知管理器配置
         notification_manager.load_config()
@@ -2662,6 +2648,8 @@ def main():
                 f"✅ Telegram媒体下载器已启动\n"
                 f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                 f"下载worker: {queue_manager.max_download_tasks}\n"
+                f"通知worker: {queue_manager.max_notify_tasks}\n"
+                f"下载队列大小: {queue_manager.download_queue_size}\n"
                 f"配置聊天数: {len(app.chat_download_config)}\n"
                 f"待重试失败任务: {total_failed_tasks}"
             )
@@ -2709,7 +2697,7 @@ def main():
 
         # 等待一小段时间让任务响应取消
         try:
-            app.loop.run_until_complete(asyncio.sleep(2))
+            app.loop.run_until_complete(asyncio.sleep(3))
         except:
             pass
 
@@ -2719,23 +2707,6 @@ def main():
             logger.success(f"{_t('Updated last read message_id to config file')}")
         except Exception as e:
             logger.error(f"保存配置时出错: {e}")
-
-        # 发送关闭通知
-        async def send_shutdown_notification():
-            shutdown_title = "程序停止"
-            shutdown_message = (
-                f"🛑 Telegram媒体下载器已停止\n"
-                f"停止时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"下载队列剩余: {download_queue.qsize()}\n"
-                f"通知队列剩余: {notify_queue.qsize()}"
-            )
-
-            await notification_manager.send_event_notification("shutdown", shutdown_title, shutdown_message)
-
-        try:
-            app.loop.run_until_complete(send_shutdown_notification())
-        except Exception as e:
-            logger.error(f"发送停止通知失败: {e}")
 
         if app.bot_token:
             try:
