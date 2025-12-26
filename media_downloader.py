@@ -407,7 +407,7 @@ async def stats_notification_task():
 
     # 启动时立即执行一次
     try:
-        stats = collect_stats()
+        stats = await collect_stats_async()  # 使用异步版本
         if stats:
             message = (
                 f"📊 统计摘要（启动测试）\n"
@@ -449,7 +449,7 @@ async def stats_notification_task():
         try:
             await asyncio.sleep(interval)
 
-            stats = collect_stats()
+            stats = await collect_stats_async()  # 使用异步版本
             if not stats:
                 logger.warning("收集统计信息失败，跳过本次通知")
                 continue
@@ -499,15 +499,15 @@ def run_async_sync(coroutine, loop=None, timeout=10):
 
 
 # 然后在需要的地方使用这个辅助函数
-def collect_stats() -> Dict[str, Any]:
-    """收集统计信息"""
+async def collect_stats_async() -> Dict[str, Any]:
+    """异步收集统计信息"""
     try:
         uptime = datetime.now() - disk_monitor.stats_start_time
         uptime_str = str(uptime).split('.')[0]
 
-        # 同步运行异步函数获取磁盘空间信息
+        # 异步获取磁盘空间信息
         try:
-            _, available_gb, total_gb = app.loop.run_until_complete(check_disk_space())
+            _, available_gb, total_gb = await check_disk_space()
         except Exception as e:
             logger.warning(f"获取磁盘空间信息失败: {e}")
             available_gb, total_gb = 0, 0
@@ -520,42 +520,50 @@ def collect_stats() -> Dict[str, Any]:
         except:
             queued_tasks = 0
 
-        # 统计所有聊天的失败任务总数（这里不进行异步调用，避免复杂化）
+        # 统计所有聊天的失败任务总数
         total_failed_tasks = 0
-        # 注意：这里我们无法在同步函数中进行异步调用，所以先设置为0
-        # 实际上，失败任务数的统计可能需要在异步上下文中进行
+        for chat_id, _ in app.chat_download_config.items():
+            try:
+                failed_tasks = await load_failed_tasks(chat_id)
+                total_failed_tasks += len(failed_tasks)
+            except Exception as e:
+                logger.warning(f"加载失败任务统计失败 ({chat_id}): {e}")
 
         return {
             "uptime": uptime_str,
             "tasks_completed": tasks_completed,
-            "tasks_failed": 0,  # 暂时设置为0，避免错误
+            "tasks_failed": total_failed_tasks,
             "tasks_skipped": 0,
-            "download_size_mb": disk_monitor.stats_since_last_notification["download_size"] / (1024 ** 2) if
-            disk_monitor.stats_since_last_notification["download_size"] else 0,
+            "download_size_mb": disk_monitor.stats_since_last_notification["download_size"] / (
+                        1024 ** 2) if disk_monitor.stats_since_last_notification.get("download_size") else 0,
             "disk_available_gb": available_gb,
             "disk_total_gb": total_gb,
-            "active_tasks": app.max_download_task - len(disk_monitor.paused_workers) if hasattr(app,
-                                                                                                'max_download_task') else 0,
+            "active_tasks": getattr(app, 'max_download_task', 5) - len(disk_monitor.paused_workers),
             "queued_tasks": queued_tasks,
             "space_low": disk_monitor.space_low,
-            "failed_tasks_pending": 0  # 暂时设置为0
+            "failed_tasks_pending": total_failed_tasks
         }
     except Exception as e:
-        logger.error(f"收集统计信息失败: {e}")
-        # 返回一个基本的字典，避免完全失败
-        return {
-            "uptime": "0:00:00",
-            "tasks_completed": 0,
-            "tasks_failed": 0,
-            "tasks_skipped": 0,
-            "download_size_mb": 0,
-            "disk_available_gb": 0,
-            "disk_total_gb": 0,
-            "active_tasks": 0,
-            "queued_tasks": 0,
-            "space_low": False,
-            "failed_tasks_pending": 0
-        }
+        logger.error(f"异步收集统计信息失败: {e}")
+        return {}
+
+
+def collect_stats() -> Dict[str, Any]:
+    """同步收集统计信息（兼容旧代码）"""
+    try:
+        # 如果在异步环境中，直接运行协程
+        if asyncio.get_event_loop().is_running():
+            # 创建新任务来运行，避免阻塞
+            task = asyncio.create_task(collect_stats_async())
+            # 这里不能等待，所以返回空字典
+            # 实际上，应该在异步上下文中调用异步版本
+            return {}
+        else:
+            # 在同步环境中运行
+            return asyncio.run(collect_stats_async())
+    except Exception as e:
+        logger.error(f"同步收集统计信息失败: {e}")
+        return {}
 
 
 def setup_exit_signal_handlers():
@@ -898,68 +906,111 @@ async def _get_media_meta(
 async def add_download_task(
         message: pyrogram.types.Message,
         node: TaskNode,
-        max_retries: int = 3
+        max_wait_time: int = 600  # 最大等待时间（秒）
 ) -> bool:
-    """添加下载任务到队列（带队列管理）"""
+    """添加下载任务到队列（队列满时等待）"""
     if message.empty:
         return False
-    
+
+    start_time = time.time()
     retry_count = 0
-    while retry_count < max_retries:
+
+    while getattr(app, 'is_running', True) and not getattr(app, 'force_exit', False):
         try:
             async with queue_manager.lock:
                 current_size = download_queue.qsize()
-                
-                # 如果队列大小超过限制，等待一段时间
-                if current_size >= queue_manager.download_batch_size:
-                    logger.debug(f"下载队列已满({current_size}/{queue_manager.download_batch_size})，等待...")
-                    await asyncio.sleep(1)
+
+                # 如果队列有空间，添加任务
+                if current_size < queue_manager.download_batch_size:
+                    node.download_status[message.id] = DownloadStatus.Downloading
+                    await download_queue.put((message, node))
+                    node.total_task += 1
+                    queue_manager.task_added += 1
+
+                    logger.debug(f"已添加下载任务: message_id={message.id}, 队列大小={download_queue.qsize()}")
+                    return True
+                else:
+                    # 队列满了，等待
+                    wait_time = min(2 ** retry_count, 5)  # 指数退避，最多5秒
+                    logger.debug(
+                        f"下载队列已满({current_size}/{queue_manager.download_batch_size})，等待 {wait_time} 秒后重试...")
                     retry_count += 1
-                    continue
-                
-                # 添加任务到队列
-                node.download_status[message.id] = DownloadStatus.Downloading
-                await download_queue.put((message, node))
-                node.total_task += 1
-                queue_manager.task_added += 1
-                
-                logger.debug(f"已添加下载任务: message_id={message.id}, 队列大小={download_queue.qsize()}")
-                return True
-        
-        except asyncio.QueueFull:
-            logger.debug(f"下载队列已满，重试 {retry_count + 1}/{max_retries}")
-            retry_count += 1
-            await asyncio.sleep(0.5)
-        except Exception as e:
-            logger.error(f"添加下载任务失败: {e}")
+                    await asyncio.sleep(wait_time)
+
+            # 检查是否超时
+            if time.time() - start_time > max_wait_time:
+                logger.warning(f"添加下载任务超时: message_id={message.id}，等待 {max_wait_time} 秒后仍未有空闲队列")
+
+                # 记录到失败列表，等待后续重试
+                await record_failed_task(node.chat_id, message.id, f"队列满，等待{max_wait_time}秒后超时")
+                return False
+
+        except asyncio.CancelledError:
+            logger.info(f"添加任务被取消: message_id={message.id}")
             return False
-    
-    logger.warning(f"添加下载任务失败，已达到最大重试次数: message_id={message.id}")
+        except Exception as e:
+            logger.error(f"添加下载任务异常: {e}")
+
+            # 检查是否要退出
+            if getattr(app, 'force_exit', False):
+                logger.debug(f"程序正在退出，放弃添加任务: message_id={message.id}")
+                return False
+
+            # 等待后重试
+            await asyncio.sleep(1)
+
+    logger.debug(f"程序停止运行，放弃添加任务: message_id={message.id}")
     return False
 
 
 async def add_download_task_batch(
         messages: List[pyrogram.types.Message],
         node: TaskNode,
-        batch_size: int = None
+        batch_size: int = None,
+        timeout_per_task: int = 30  # 每个任务的超时时间
 ) -> int:
-    """批量添加下载任务"""
+    """批量添加下载任务（带超时控制）"""
     if batch_size is None:
         batch_size = queue_manager.download_batch_size
-    
+
     added_count = 0
+    failed_count = 0
+
     for message in messages:
-        if await add_download_task(message, node):
-            added_count += 1
-        
-        # 如果达到批量大小，等待队列处理
+        try:
+            # 设置超时控制
+            try:
+                # 使用 asyncio.wait_for 设置每个任务的超时
+                task = asyncio.create_task(add_download_task(message, node, timeout_per_task))
+                success = await asyncio.wait_for(task, timeout=timeout_per_task + 5)
+
+                if success:
+                    added_count += 1
+                else:
+                    failed_count += 1
+                    logger.warning(f"添加任务失败: message_id={message.id}")
+            except asyncio.TimeoutError:
+                logger.warning(f"添加任务超时: message_id={message.id}")
+                await record_failed_task(node.chat_id, message.id, f"添加任务超时（{timeout_per_task}秒）")
+                failed_count += 1
+
+        except Exception as e:
+            logger.error(f"批量添加任务时异常 (message_id={message.id}): {e}")
+            failed_count += 1
+
+        # 如果达到批量大小，等待队列处理一部分
         if added_count >= batch_size:
             logger.debug(f"已添加批量任务 {added_count} 个，等待队列处理...")
-            
+
             # 等待队列大小减少到一半以下
             while download_queue.qsize() > batch_size // 2:
                 await asyncio.sleep(1)
-    
+
+    if failed_count > 0:
+        logger.warning(f"批量添加完成: 成功 {added_count} 个，失败 {failed_count} 个")
+    else:
+        logger.info(f"批量添加完成: 成功添加 {added_count} 个任务")
+
     return added_count
 
 
