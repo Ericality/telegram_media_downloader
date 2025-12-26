@@ -321,29 +321,32 @@ async def stats_notification_task():
         try:
             bark_config = getattr(app, 'bark_notification', {})
             interval = bark_config.get('stats_notification_interval', 3600)
-            
+
             await asyncio.sleep(interval)
-            
+
             events_to_notify = bark_config.get('events_to_notify', [])
             if 'stats_summary' not in events_to_notify:
                 continue
-            
+
             stats = collect_stats()
+
+            # 构建更详细的消息
             message = (
                 f"📊 统计摘要\n"
                 f"运行时间: {stats['uptime']}\n"
                 f"完成任务: {stats['tasks_completed']}\n"
-                f"失败任务: {stats['tasks_failed']}\n"
-                f"跳过任务: {stats['tasks_skipped']}\n"
+                f"失败任务(待重试): {stats['failed_tasks_pending']}\n"
                 f"下载大小: {stats['download_size_mb']:.2f}MB\n"
-                f"磁盘可用: {stats['disk_available_gb']:.2f}GB\n"
+                f"磁盘可用: {stats['disk_available_gb']:.2f}GB/{stats['disk_total_gb']:.2f}GB\n"
                 f"活动任务: {stats['active_tasks']}\n"
                 f"队列任务: {stats['queued_tasks']}\n"
+                f"空间不足: {'是' if stats['space_low'] else '否'}\n"
                 f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             )
-            
+
             await send_bark_notification("下载统计", message)
-            
+
+            # 重置统计
             disk_monitor.stats_since_last_notification = {
                 "tasks_completed": 0,
                 "tasks_failed": 0,
@@ -354,28 +357,52 @@ async def stats_notification_task():
             logger.error(f"统计通知任务出错: {e}")
 
 
+def run_async_sync(coroutine, loop=None, timeout=10):
+    """同步运行异步函数"""
+    if loop is None:
+        loop = app.loop
+
+    if loop and loop.is_running():
+        # 如果事件循环正在运行，使用run_coroutine_threadsafe
+        import asyncio as aio
+        future = aio.run_coroutine_threadsafe(coroutine, loop)
+        return future.result(timeout=timeout)
+    else:
+        # 否则使用run_until_complete
+        return loop.run_until_complete(coroutine)
+
+
+# 然后在需要的地方使用这个辅助函数
 def collect_stats() -> Dict[str, Any]:
-    """收集统计信息"""
+    """收集统计信息，包含失败任务数"""
     try:
         uptime = datetime.now() - disk_monitor.stats_start_time
         uptime_str = str(uptime).split('.')[0]
-        
-        _, available_gb, total_gb = asyncio.run(check_disk_space())
+
+        # 使用辅助函数同步运行异步函数
+        _, available_gb, total_gb = run_async_sync(check_disk_space())
+
         tasks_completed = getattr(app, 'total_download_task', 0)
-        tasks_failed = len(disk_monitor.paused_workers)
         queued_tasks = download_queue.qsize()
-        
+
+        # 统计所有聊天的失败任务总数
+        total_failed_tasks = 0
+        for chat_id, _ in app.chat_download_config.items():
+            failed_tasks = run_async_sync(load_failed_tasks(chat_id))
+            total_failed_tasks += len(failed_tasks)
+
         return {
             "uptime": uptime_str,
             "tasks_completed": tasks_completed,
-            "tasks_failed": tasks_failed,
+            "tasks_failed": total_failed_tasks,
             "tasks_skipped": 0,
             "download_size_mb": disk_monitor.stats_since_last_notification["download_size"] / (1024 ** 2),
             "disk_available_gb": available_gb,
             "disk_total_gb": total_gb,
             "active_tasks": app.max_download_task - len(disk_monitor.paused_workers),
             "queued_tasks": queued_tasks,
-            "space_low": disk_monitor.space_low
+            "space_low": disk_monitor.space_low,
+            "failed_tasks_pending": total_failed_tasks
         }
     except Exception as e:
         logger.error(f"收集统计信息失败: {e}")
@@ -489,89 +516,118 @@ async def run_until_all_task_finish():
 
 
 async def record_failed_task(chat_id: Union[int, str], message_id: int, error_msg: str):
-    """记录失败的任务以便重试"""
+    """记录失败的任务以便重试（无限重试）"""
     try:
         failed_tasks_file = os.path.join(app.session_file_path, "failed_tasks.json")
         failed_tasks = {}
-        
+
         if os.path.exists(failed_tasks_file):
             try:
                 with open(failed_tasks_file, 'r', encoding='utf-8') as f:
                     failed_tasks = json.load(f)
             except:
                 failed_tasks = {}
-        
+
         chat_key = str(chat_id)
         if chat_key not in failed_tasks:
             failed_tasks[chat_key] = []
-        
-        task_entry = {
-            'message_id': message_id,
-            'error': error_msg[:200],
-            'timestamp': datetime.now().isoformat(),
-            'retry_count': 0
-        }
-        
-        existing = False
+
+        # 查找是否已经存在该任务
         existing_index = -1
         for i, task in enumerate(failed_tasks[chat_key]):
             if task['message_id'] == message_id:
-                existing = True
                 existing_index = i
-                task['retry_count'] += 1
-                task['timestamp'] = datetime.now().isoformat()
-                task['error'] = error_msg[:200]
                 break
-        
-        if not existing:
+
+        task_entry = {
+            'message_id': message_id,
+            'error': error_msg[:500],  # 保留更长的错误信息
+            'timestamp': datetime.now().isoformat(),
+            'retry_count': 0
+        }
+
+        if existing_index >= 0:
+            # 更新已有的失败任务，增加重试次数
+            existing_task = failed_tasks[chat_key][existing_index]
+            existing_task['retry_count'] += 1
+            existing_task['timestamp'] = datetime.now().isoformat()
+            existing_task['error'] = error_msg[:500]
+            retry_count = existing_task['retry_count']
+            logger.warning(f"更新失败任务: chat_id={chat_id}, message_id={message_id}, 重试次数: {retry_count}")
+        else:
+            # 添加新的失败任务
             failed_tasks[chat_key].append(task_entry)
             retry_count = 0
-        else:
-            retry_count = failed_tasks[chat_key][existing_index]['retry_count']
-        
-        if len(failed_tasks[chat_key]) > 100:
-            failed_tasks[chat_key] = failed_tasks[chat_key][-100:]
-        
+            logger.warning(f"记录新失败任务: chat_id={chat_id}, message_id={message_id}")
+
+        # 移除100条限制 - 无限记录失败任务
+        # if len(failed_tasks[chat_key]) > 100:
+        #     failed_tasks[chat_key] = failed_tasks[chat_key][-100:]
+
+        # 保存到文件
         with open(failed_tasks_file, 'w', encoding='utf-8') as f:
             json.dump(failed_tasks, f, ensure_ascii=False, indent=2)
-        
-        logger.warning(f"任务失败记录: chat_id={chat_id}, message_id={message_id}, 重试次数: {retry_count}")
+
+        return retry_count
     except Exception as e:
         logger.error(f"记录失败任务时出错: {e}")
+        return 0
 
 
 async def load_failed_tasks(chat_id: Union[int, str]) -> list:
-    """加载失败的任务"""
+    """加载失败的任务（无限重试，不过滤时间）"""
     try:
         failed_tasks_file = os.path.join(app.session_file_path, "failed_tasks.json")
         if not os.path.exists(failed_tasks_file):
             return []
-        
+
         with open(failed_tasks_file, 'r', encoding='utf-8') as f:
             all_failed_tasks = json.load(f)
-        
+
         chat_key = str(chat_id)
         if chat_key in all_failed_tasks:
-            now = datetime.now()
-            recent_tasks = []
-            for task in all_failed_tasks[chat_key]:
-                try:
-                    task_time = datetime.fromisoformat(task['timestamp'])
-                    if (now - task_time).total_seconds() < 24 * 3600:
-                        recent_tasks.append(task)
-                except:
-                    recent_tasks.append(task)
-            
-            all_failed_tasks[chat_key] = recent_tasks
-            with open(failed_tasks_file, 'w', encoding='utf-8') as f:
-                json.dump(all_failed_tasks, f, ensure_ascii=False, indent=2)
-            
-            return recent_tasks
-        
+            # 移除时间过滤，所有失败任务都返回
+            # 移除最大重试次数限制，无限重试
+            return all_failed_tasks[chat_key]
+
         return []
     except Exception as e:
         logger.error(f"加载失败任务时出错: {e}")
         return []
+
+
+async def remove_failed_task(chat_id: Union[int, str], message_id: int):
+    """从失败任务列表中移除已成功的任务"""
+    try:
+        failed_tasks_file = os.path.join(app.session_file_path, "failed_tasks.json")
+        if not os.path.exists(failed_tasks_file):
+            return False
+
+        with open(failed_tasks_file, 'r', encoding='utf-8') as f:
+            all_failed_tasks = json.load(f)
+
+        chat_key = str(chat_id)
+        if chat_key not in all_failed_tasks:
+            return False
+
+        # 查找并移除任务
+        original_count = len(all_failed_tasks[chat_key])
+        all_failed_tasks[chat_key] = [
+            task for task in all_failed_tasks[chat_key]
+            if task['message_id'] != message_id
+        ]
+        removed = original_count != len(all_failed_tasks[chat_key])
+
+        if removed:
+            # 保存更新后的列表
+            with open(failed_tasks_file, 'w', encoding='utf-8') as f:
+                json.dump(all_failed_tasks, f, ensure_ascii=False, indent=2)
+            logger.info(f"从失败列表移除成功任务: chat_id={chat_id}, message_id={message_id}")
+
+        return removed
+    except Exception as e:
+        logger.error(f"移除失败任务时出错: {e}")
+        return False
 
 
 def _check_download_finish(media_size: int, download_path: str, ui_file_name: str):
@@ -792,25 +848,29 @@ async def download_task(
     original_download_status, file_name = await download_media(
         client, message, app.media_types, app.file_formats, node
     )
-    
+
+    # 如果下载成功，从失败列表中移除
+    if original_download_status == DownloadStatus.SuccessDownload:
+        await remove_failed_task(node.chat_id, message.id)
+
     if file_name and os.path.exists(file_name):
         try:
             file_size = os.path.getsize(file_name)
             disk_monitor.stats_since_last_notification["download_size"] += file_size
         except:
             pass
-    
+
     if app.enable_download_txt and message.text and not message.media:
         download_status, file_name = await save_msg_to_file(app, node.chat_id, message)
     else:
         download_status, file_name = original_download_status, file_name
-    
+
     if not node.bot:
         app.set_download_id(node, message.id, download_status)
-    
+
     node.download_status[message.id] = download_status
     file_size = os.path.getsize(file_name) if file_name else 0
-    
+
     await upload_telegram_chat(
         client,
         node.upload_user if node.upload_user else client,
@@ -820,7 +880,7 @@ async def download_task(
         download_status,
         file_name,
     )
-    
+
     if (
             not node.upload_telegram_chat_id
             and download_status is DownloadStatus.SuccessDownload
@@ -832,14 +892,14 @@ async def download_task(
                 file_name, update_cloud_upload_stat, (node, message.id, ui_file_name)
         ):
             node.upload_success_count += 1
-    
+
     await report_bot_download_status(
         node.bot,
         node,
         download_status,
         file_size,
     )
-    
+
     queue_manager.task_processed += 1
 
 
@@ -1127,15 +1187,16 @@ async def download_worker(client: pyrogram.client.Client, worker_id: int):
                 raise  # 重新抛出异常
             except OSError as e:
                 logger.error(f"下载Worker {worker_id}: 消息 {message.id} 网络连接错误: {e}")
-                await record_failed_task(node.chat_id, message.id, str(e))
+                # 记录失败任务，下次重试
+                retry_count = await record_failed_task(node.chat_id, message.id, f"网络错误: {str(e)}")
                 node.download_status[message.id] = DownloadStatus.FailedDownload
-                # 将失败任务重新放入队列，等待重试
-                await asyncio.sleep(10)
-                await download_queue.put((message, node))
+                logger.warning(f"消息 {message.id} 网络错误，已记录到失败列表（重试次数: {retry_count}）")
             except Exception as e:
                 logger.error(f"下载Worker {worker_id}: 消息 {message.id} 下载任务异常: {e}")
-                await record_failed_task(node.chat_id, message.id, str(e))
+                # 记录失败任务，下次重试
+                retry_count = await record_failed_task(node.chat_id, message.id, f"下载异常: {str(e)}")
                 node.download_status[message.id] = DownloadStatus.FailedDownload
+                logger.warning(f"消息 {message.id} 下载异常，已记录到失败列表（重试次数: {retry_count}）")
             finally:
                 download_queue.task_done()
 
@@ -1154,7 +1215,7 @@ async def download_chat_task(
         chat_download_config: ChatDownloadConfig,
         node: TaskNode,
 ):
-    """下载所有任务（带流控）"""
+    """下载所有任务（带流控），包含失败任务重试"""
     messages_iter = get_chat_history_v2(
         client,
         node.chat_id,
@@ -1163,66 +1224,44 @@ async def download_chat_task(
         offset_id=chat_download_config.last_read_message_id,
         reverse=True,
     )
-    
+
     chat_download_config.node = node
-    
-    # 重试之前的失败任务
+
+    # 先重试之前的失败任务（每次启动时都重试）
     failed_tasks = await load_failed_tasks(node.chat_id)
     if failed_tasks:
-        logger.info(f"发现 {len(failed_tasks)} 个失败任务等待重试")
-        
+        logger.info(f"启动时发现 {len(failed_tasks)} 个失败任务等待重试")
+
+        # 统计重试次数分布
         retry_counts = {}
         for task in failed_tasks:
             count = task.get('retry_count', 0)
             retry_counts[count] = retry_counts.get(count, 0) + 1
-        
+
         logger.info("失败任务重试次数统计：")
         for count, num in sorted(retry_counts.items()):
             logger.info(f"  重试次数 {count}: {num} 个任务")
-        
-        retry_messages = []
-        for task in failed_tasks:
-            try:
-                if task.get('retry_count', 0) < 3:
-                    message = await client.get_messages(
-                        chat_id=node.chat_id,
-                        message_ids=task['message_id']
-                    )
-                    if message and not message.empty:
-                        retry_messages.append(message)
-                        logger.debug(f"已获取重试消息: message_id={task['message_id']}")
-                    else:
-                        logger.warning(f"消息 {task['message_id']} 获取失败或为空")
-                else:
-                    logger.warning(f"消息 {task['message_id']} 已达到最大重试次数（3次），跳过")
-            except Exception as e:
-                logger.warning(f"重试失败任务时出错（消息ID: {task['message_id']}）: {e}")
-        
-        # 批量添加重试任务
-        if retry_messages:
-            added = await add_download_task_batch(retry_messages, node)
-            logger.info(f"已添加 {added} 个重试任务到队列")
-    
+
     # 原有的ids_to_retry逻辑
     if chat_download_config.ids_to_retry:
         logger.info(f"{_t('Downloading files failed during last run')}...")
         skipped_messages: list = await client.get_messages(
             chat_id=node.chat_id, message_ids=chat_download_config.ids_to_retry
         )
-        
+
         logger.info(f"上次运行失败的 {len(chat_download_config.ids_to_retry)} 个任务")
-        
+
         if skipped_messages:
             added = await add_download_task_batch(skipped_messages, node)
             logger.info(f"已添加 {added} 个上次失败任务到队列")
-    
+
     # 主消息迭代器处理（带流控）
     batch_messages = []
     batch_size = queue_manager.download_batch_size
-    
+
     async for message in messages_iter:
         meta_data = MetaData()
-        
+
         caption = message.caption
         if caption:
             caption = validate_title(caption)
@@ -1233,18 +1272,18 @@ async def download_chat_task(
         else:
             caption = app.get_caption_name(node.chat_id, message.media_group_id)
         set_meta_data(meta_data, message, caption)
-        
+
         if app.need_skip_message(chat_download_config, message.id):
             continue
-        
+
         if app.exec_filter(chat_download_config, meta_data):
             batch_messages.append(message)
-            
+
             # 当收集到足够的消息时，批量添加
             if len(batch_messages) >= batch_size:
                 added = await add_download_task_batch(batch_messages, node, batch_size)
                 batch_messages = []
-                
+
                 if node.total_task % 100 == 0:
                     logger.info(f"已添加 {node.total_task} 个下载任务到队列...")
         else:
@@ -1258,16 +1297,16 @@ async def download_chat_task(
                     message,
                     DownloadStatus.SkipDownload,
                 )
-    
+
     # 添加剩余的消息
     if batch_messages:
         added = await add_download_task_batch(batch_messages, node, len(batch_messages))
-    
+
     chat_download_config.need_check = True
     chat_download_config.total_task = node.total_task
     node.is_running = True
-    
-    logger.info(f"任务添加完成，共 {node.total_task} 个任务等待下载")
+
+    logger.info(f"新任务添加完成，共 {node.total_task} 个任务等待下载")
 
 
 async def download_all_chat(client: pyrogram.Client):
@@ -1283,17 +1322,104 @@ async def download_all_chat(client: pyrogram.Client):
 
 
 async def run_until_all_task_finish():
-    """正常运行直到所有任务完成"""
+    """正常运行直到所有任务完成，并在完成后继续重试失败任务"""
+    logger.info("开始主运行循环...")
+
+    # 阶段1：处理所有新任务
     while True:
-        finish: bool = True
+        # 检查是否要退出
+        if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
+            logger.info("收到退出信号，准备退出...")
+            break
+
+        # 检查所有新任务是否完成
+        all_new_tasks_done = True
         for _, value in app.chat_download_config.items():
             if not value.need_check or value.total_task != value.finish_task:
-                finish = False
-        
-        if (not app.bot_token and finish) or getattr(app, 'restart_program', False) or getattr(app, 'force_exit', False):
+                all_new_tasks_done = False
+                break
+
+        # 如果新任务全部完成，进入阶段2：重试失败任务
+        if all_new_tasks_done:
+            logger.info("所有新任务已完成，开始重试失败任务...")
             break
-        
+
+        # 检查是否需要重启或停止
+        if (not app.bot_token and all_new_tasks_done) or getattr(app, 'restart_program', False):
+            break
+
         await asyncio.sleep(1)
+
+    # 阶段2：重试失败任务（无限重试直到成功）
+    if not getattr(app, 'force_exit', False) and getattr(app, 'is_running', True):
+        logger.info("进入失败任务重试阶段...")
+
+        # 无限循环重试失败任务
+        while getattr(app, 'is_running', True) and not getattr(app, 'force_exit', False):
+            try:
+                # 检查是否有任何活动任务
+                has_active_tasks = False
+                for _, value in app.chat_download_config.items():
+                    if value.node and value.node.download_status:
+                        downloading_tasks = sum(1 for status in value.node.download_status.values()
+                                                if status == DownloadStatus.Downloading)
+                        if downloading_tasks > 0:
+                            has_active_tasks = True
+                            break
+
+                # 如果没有活动任务，尝试重试失败任务
+                if not has_active_tasks and download_queue.empty():
+                    # 为每个聊天重试失败任务
+                    total_retried = 0
+                    total_failed_tasks = 0
+
+                    for chat_id, value in app.chat_download_config.items():
+                        if value.node:
+                            # 加载失败任务数量
+                            failed_tasks = await load_failed_tasks(chat_id)
+                            total_failed_tasks += len(failed_tasks)
+
+                            if failed_tasks:
+                                logger.info(f"聊天 {chat_id} 有 {len(failed_tasks)} 个失败任务，开始重试...")
+
+                                # 每次重试一批（避免一次性添加太多）
+                                retried, added = await retry_failed_tasks(
+                                    value.node.client if value.node.client else client,
+                                    chat_id,
+                                    value.node,
+                                    max_batch=queue_manager.max_download_tasks * 2  # 根据worker数量调整
+                                )
+
+                                total_retried += retried
+
+                                if added > 0:
+                                    logger.info(f"已为聊天 {chat_id} 添加 {added} 个失败任务重试")
+                                    # 等待一段时间让新任务开始处理
+                                    await asyncio.sleep(5)
+
+                    # 如果没有任何失败任务需要重试，等待一段时间再检查
+                    if total_failed_tasks == 0:
+                        logger.info("当前没有失败任务需要重试，等待30秒后再次检查...")
+                        await asyncio.sleep(30)
+                    elif total_retried == 0:
+                        logger.info("尝试重试失败任务但未能获取消息，等待30秒后重试...")
+                        await asyncio.sleep(30)
+                    else:
+                        logger.info(f"本轮重试了 {total_retried} 个失败任务，等待处理完成...")
+                        await asyncio.sleep(10)
+                else:
+                    # 还有活动任务，等待
+                    await asyncio.sleep(5)
+
+                # 检查是否需要重启或停止
+                if getattr(app, 'restart_program', False) or getattr(app, 'force_exit', False):
+                    break
+
+            except Exception as e:
+                logger.error(f"重试失败任务循环中出错: {e}")
+                await asyncio.sleep(30)
+
+    logger.info("主运行循环结束")
 
 
 def _exec_loop():
@@ -1536,6 +1662,7 @@ def check_config_consistency(app):
     
     return issues
 
+
 def main():
     """主函数"""
     setup_exit_signal_handlers()
@@ -1557,102 +1684,33 @@ def main():
     try:
         app.pre_run()
         init_web(app)
-        
-        # ========== 配置调试信息 ==========
-        logger.info("正在验证配置...")
-        # 检查配置加载情况
-        logger.info("检查配置加载情况...")
 
-        # 检查config字典
-        if hasattr(app, 'config') and app.config:
-            logger.info(f"config字典中的键: {list(app.config.keys())}")
-            if 'bark_notification' in app.config:
-                logger.info(f"config中找到bark_notification: {app.config['bark_notification']}")
-            else:
-                logger.warning("config中未找到bark_notification")
-        else:
-            logger.error("app.config不存在或为空")
-
-        # 检查app对象的bark_notification属性
-        if hasattr(app, 'bark_notification'):
-            logger.info(f"app.bark_notification存在，类型: {type(app.bark_notification)}，值: {app.bark_notification}")
-        else:
-            logger.error("app.bark_notification属性不存在!")
-
-        # 检查Application类是否已修复
-        logger.info("检查Application类配置...")
-        logger.info(f"Application类是否有bark_notification属性: {hasattr(app.__class__, 'bark_notification')}")
-        # 打印配置摘要
+        # 配置调试信息
         print_config_summary(app)
-        
+
         # 检查配置一致性
         issues = check_config_consistency(app)
         if issues:
             logger.warning("配置检查发现问题:")
             for i, issue in enumerate(issues, 1):
                 logger.warning(f"  {i}. {issue}")
-            logger.warning("程序可能无法正常工作!")
         else:
             logger.success("配置检查通过!")
-        
-        # 在main函数中，找到错误的那一行（大约第1376行），修改如下：
 
-        # 详细调试信息
-        # 修复：loguru的logger.level是一个方法，不能直接比较
-        try:
-            # 获取当前logger的级别值
-            current_level = logger._core.min_level  # loguru的内部属性，但这是获取当前最小级别的有效方法
-            logger.debug(f"当前日志级别值: {current_level}")
-            
-            if current_level <= 10:  # 10对应DEBUG级别
-                logger.debug("=" * 40)
-                logger.debug("详细配置信息:")
-                
-                # 列出app对象的所有属性
-                logger.debug("App对象属性列表:")
-                for attr_name in dir(app):
-                    if not attr_name.startswith('_'):  # 不显示私有属性
-                        try:
-                            attr_value = getattr(app, attr_name)
-                            # 只显示简单类型的属性
-                            if not callable(attr_value):  # 排除方法
-                                logger.debug(f"  {attr_name}: {type(attr_value).__name__}")
-                        except:
-                            pass
-                
-                # 检查config字典内容
-                if hasattr(app, 'config') and app.config:
-                    logger.debug("\nConfig字典内容:")
-                    for key, value in app.config.items():
-                        if key not in ['api_id', 'api_hash', 'bot_token', 'web_login_secret']:  # 排除敏感信息
-                            logger.debug(f"  {key}: {value}")
-                        else:
-                            logger.debug(f"  {key}: [敏感信息已隐藏]")
-                logger.debug("=" * 40)
-        except Exception as e:
-            logger.warning(f"无法获取详细调试信息: {e}")
-        
-        # 检查Bark配置加载情况
-        if hasattr(app, 'bark_notification'):
-            logger.info(f"Bark配置类型: {type(app.bark_notification)}")
-            logger.info(f"Bark配置内容: {app.bark_notification}")
-        else:
-            logger.error("Bark配置属性不存在!")
-        
         # 更新队列管理器配置
         queue_manager.update_limits()
-        
+
         # 设置全局异常处理器
         def global_exception_handler(loop, context):
             exception = context.get('exception')
             if exception:
                 logger.error(f"未处理的异常: {exception}")
             logger.error(f"异常上下文: {context}")
-            
+
             if hasattr(app, 'force_exit') and app.force_exit:
                 logger.info("强制退出程序中...")
                 sys.exit(1)
-        
+
         app.loop.set_exception_handler(global_exception_handler)
         set_max_concurrent_transmissions(client, app.max_concurrent_transmissions)
 
@@ -1685,11 +1743,22 @@ def main():
         if hasattr(app, 'bark_notification') and app.bark_notification.get('enabled', False):
             events_to_notify = app.bark_notification.get('events_to_notify', [])
             if 'startup' in events_to_notify:
+                # 使用辅助函数同步获取失败任务数
+                async def get_total_failed_tasks():
+                    total = 0
+                    for chat_id, _ in app.chat_download_config.items():
+                        failed_tasks = await load_failed_tasks(chat_id)
+                        total += len(failed_tasks)
+                    return total
+
+                total_failed_tasks = run_async_sync(get_total_failed_tasks(), timeout=30)
+
                 startup_msg = (
                     f"✅ Telegram媒体下载器已启动\n"
                     f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                     f"下载worker: {queue_manager.max_download_tasks}\n"
-                    f"配置聊天数: {len(app.chat_download_config)}"
+                    f"配置聊天数: {len(app.chat_download_config)}\n"
+                    f"待重试失败任务: {total_failed_tasks}"
                 )
                 app.loop.create_task(send_bark_notification("程序启动", startup_msg))
 
@@ -1702,6 +1771,7 @@ def main():
 
         logger.info("=" * 60)
         logger.info("所有组件已启动，开始处理任务...")
+        logger.info("失败任务将无限重试直到成功")
         logger.info("=" * 60)
 
         # 主运行循环
@@ -1762,6 +1832,22 @@ def main():
             f"{_t('total upload file')} "
             f"{app.cloud_drive_config.total_upload_success_file_count}"
         )
+
+        # 统计并显示失败任务
+        try:
+            async def get_final_failed_tasks():
+                total = 0
+                for chat_id, _ in app.chat_download_config.items():
+                    failed_tasks = await load_failed_tasks(chat_id)
+                    total += len(failed_tasks)
+                return total
+
+            total_failed_tasks = run_async_sync(get_final_failed_tasks(), timeout=30)
+            if total_failed_tasks > 0:
+                logger.warning(f"仍有 {total_failed_tasks} 个任务待重试，将在下次启动时继续重试")
+        except Exception as e:
+            logger.error(f"统计失败任务时出错: {e}")
+
         logger.info(f"队列管理器统计: 添加任务={queue_manager.task_added}, 处理任务={queue_manager.task_processed}")
         logger.info("=" * 60)
 
