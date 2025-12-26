@@ -842,9 +842,14 @@ async def disk_space_monitor_task():
         logger.error(f"启动时磁盘空间检查失败: {e}")
 
     # 开始定期检查
-    while getattr(app, 'is_running', True):
+    while True:
+        # 检查是否要退出
+        if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
+            logger.info("磁盘空间监控任务收到退出信号，准备退出")
+            break
+
         try:
-            await asyncio.sleep(check_interval)
+            await asyncio.sleep(min(check_interval, 5))  # 最多等待5秒，以便快速响应退出信号
 
             has_space, available_gb, total_gb = await check_disk_space(threshold_gb)
             current_time = time.time()
@@ -871,6 +876,8 @@ async def disk_space_monitor_task():
         except Exception as e:
             logger.error(f"磁盘空间监控任务出错: {e}")
             await asyncio.sleep(60)
+
+    logger.info("磁盘空间监控任务已停止")
 
 
 async def stats_notification_task():
@@ -1084,10 +1091,15 @@ async def graceful_shutdown():
     if hasattr(app, 'is_running'):
         app.is_running = False
 
-    # 2. 等待当前处理的任务完成（最多30秒）
+    # 2. 立即停止所有下载worker（包括被暂停的）
+    logger.info("停止所有下载worker...")
+    # 清除暂停状态，让worker能正常退出
+    disk_monitor.paused_workers.clear()
+
+    # 3. 等待当前处理的任务完成（最多15秒）
     logger.info("等待当前任务完成...")
     wait_start = time.time()
-    max_wait_time = 30
+    max_wait_time = 15  # 减少等待时间
 
     while time.time() - wait_start < max_wait_time:
         # 检查是否还有任务在处理
@@ -1101,13 +1113,37 @@ async def graceful_shutdown():
             logger.info("所有活动任务已完成")
             break
 
-        if time.time() - wait_start > 10:  # 每10秒报告一次
+        # 每5秒报告一次状态
+        if time.time() - wait_start > 5 and int(time.time() - wait_start) % 5 == 0:
             logger.info(f"还有 {active_tasks} 个活动任务和 {download_queue.qsize()} 个队列任务在处理中...")
-            wait_start = time.time()  # 重置计时器，避免频繁报告
 
         await asyncio.sleep(1)
 
-    # 3. 发送关闭通知（如果启用）
+    # 4. 如果还有任务在处理，强制停止
+    if active_tasks > 0 or not download_queue.empty():
+        logger.warning(f"强制停止: 还有 {active_tasks} 个活动任务和 {download_queue.qsize()} 个队列任务")
+
+        # 记录所有未完成的任务
+        pending_messages = []
+        try:
+            # 获取队列中所有待处理的任务
+            while not download_queue.empty():
+                try:
+                    message, node = download_queue.get_nowait()
+                    pending_messages.append((message.id, node.chat_id))
+                    download_queue.task_done()
+                except (asyncio.QueueEmpty, ValueError):
+                    break
+
+            # 记录所有未完成的任务到失败列表
+            for message_id, chat_id in pending_messages:
+                await record_failed_task(chat_id, message_id, "程序退出，任务未完成")
+
+            logger.warning(f"已记录 {len(pending_messages)} 个未完成任务到失败列表")
+        except Exception as e:
+            logger.error(f"记录未完成任务时出错: {e}")
+
+    # 5. 发送关闭通知（如果启用）
     try:
         # 收集统计信息
         try:
@@ -1121,6 +1157,7 @@ async def graceful_shutdown():
             f"停止时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"运行时间: {stats.get('uptime', 'N/A') if stats else 'N/A'}\n"
             f"完成任务: {stats.get('tasks_completed', 0) if stats else 0}\n"
+            f"未完成任务: {len(pending_messages) if 'pending_messages' in locals() else 0}\n"
             f"下载队列剩余: {download_queue.qsize()}\n"
             f"通知队列剩余: {notify_queue.qsize()}\n"
             f"关闭耗时: {time.time() - shutdown_start_time:.1f}秒"
@@ -1129,7 +1166,7 @@ async def graceful_shutdown():
         # 发送关闭通知
         if notification_manager.bark_enabled or notification_manager.synology_chat_enabled:
             logger.info("发送关闭通知...")
-            # 同步发送通知，确保在退出前发送
+            # 使用同步发送，确保在退出前发送
             success = await notification_manager.send_event_notification(
                 "shutdown",
                 "程序停止",
@@ -1147,7 +1184,7 @@ async def graceful_shutdown():
     except Exception as e:
         logger.error(f"发送停止通知失败: {e}")
 
-    # 4. 清空队列
+    # 6. 清空队列
     logger.info("清空队列...")
     try:
         # 记录清空前队列状态
@@ -1158,7 +1195,9 @@ async def graceful_shutdown():
         cleared_download = 0
         while not download_queue.empty():
             try:
-                download_queue.get_nowait()
+                message, node = download_queue.get_nowait()
+                # 记录到失败任务
+                await record_failed_task(node.chat_id, message.id, "程序退出，队列任务被清除")
                 download_queue.task_done()
                 cleared_download += 1
             except (asyncio.QueueEmpty, ValueError):
@@ -1521,8 +1560,7 @@ async def add_download_task(
     while True:
         # 首先检查是否要退出
         if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
-            logger.debug(f"程序正在退出，记录失败任务: message_id={message.id}")
-            await record_failed_task(node.chat_id, message.id, "程序退出")
+            logger.debug(f"程序正在退出，跳过添加任务: message_id={message.id}")
             return False
 
         try:
@@ -1536,8 +1574,7 @@ async def add_download_task(
                     if current_size < queue_capacity:  # 双重检查
                         # 再次检查是否要退出
                         if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
-                            logger.debug(f"程序正在退出，记录失败任务: message_id={message.id}")
-                            await record_failed_task(node.chat_id, message.id, "程序退出")
+                            logger.debug(f"程序正在退出，跳过添加任务: message_id={message.id}")
                             return False
 
                         node.download_status[message.id] = DownloadStatus.Downloading
@@ -1573,8 +1610,7 @@ async def add_download_task(
             for _ in range(10):  # 每0.1秒检查一次，总共1秒
                 await asyncio.sleep(0.1)
                 if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
-                    logger.debug(f"程序正在退出，记录失败任务: message_id={message.id}")
-                    await record_failed_task(node.chat_id, message.id, "程序退出")
+                    logger.debug(f"程序正在退出，跳过添加任务: message_id={message.id}")
                     return False
 
         except asyncio.CancelledError:
@@ -1587,16 +1623,12 @@ async def add_download_task(
 
             # 检查是否要退出
             if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
-                logger.debug(f"程序正在退出，记录失败任务: message_id={message.id}")
-                await record_failed_task(node.chat_id, message.id, f"程序退出: {e}")
+                logger.debug(f"程序正在退出，跳过添加任务: message_id={message.id}")
                 return False
 
             # 等待后继续尝试
             await asyncio.sleep(5)
 
-    # 程序停止运行
-    logger.debug(f"程序停止，记录失败任务: message_id={message.id}")
-    await record_failed_task(node.chat_id, message.id, "程序停止运行")
     return False
 
 
@@ -1972,32 +2004,39 @@ async def download_worker(client: pyrogram.client.Client, worker_id: int):
             break
 
         try:
-            # 检查磁盘空间
-            bark_config = getattr(app, 'bark_notification', {})
-            threshold_gb = bark_config.get('disk_space_threshold_gb', 10.0)
+            # 检查磁盘空间（但如果程序正在退出，跳过检查）
+            if not getattr(app, 'force_exit', False):
+                bark_config = getattr(app, 'bark_notification', {})
+                threshold_gb = bark_config.get('disk_space_threshold_gb', 10.0)
 
-            has_space, available_gb, _ = await check_disk_space(threshold_gb)
+                has_space, available_gb, _ = await check_disk_space(threshold_gb)
 
-            if not has_space:
-                if worker_id not in disk_monitor.paused_workers:
-                    logger.warning(
-                        f"下载Worker {worker_id}: 磁盘空间不足 ({available_gb}GB < {threshold_gb}GB)，暂停下载")
-                    disk_monitor.paused_workers.add(worker_id)
+                if not has_space:
+                    if worker_id not in disk_monitor.paused_workers:
+                        logger.warning(
+                            f"下载Worker {worker_id}: 磁盘空间不足 ({available_gb}GB < {threshold_gb}GB)，暂停下载")
+                        disk_monitor.paused_workers.add(worker_id)
 
-                    events_to_notify = bark_config.get('events_to_notify', [])
-                    if 'task_paused' in events_to_notify:
-                        message = f"Worker {worker_id}: 因磁盘空间不足暂停下载\n可用空间: {available_gb}GB"
-                        await send_bark_notification("下载任务暂停", message)
+                        events_to_notify = bark_config.get('events_to_notify', [])
+                        if 'task_paused' in events_to_notify:
+                            message = f"Worker {worker_id}: 因磁盘空间不足暂停下载\n可用空间: {available_gb}GB"
+                            await send_bark_notification("下载任务暂停", message)
 
-                await asyncio.sleep(60)
-                continue
-            else:
-                if worker_id in disk_monitor.paused_workers:
-                    logger.info(f"下载Worker {worker_id}: 磁盘空间恢复，继续下载")
-                    disk_monitor.paused_workers.discard(worker_id)
+                    # 如果程序正在退出，不清除暂停状态
+                    if not getattr(app, 'force_exit', False):
+                        await asyncio.sleep(60)
+                        continue
+                    else:
+                        # 程序正在退出，直接退出循环
+                        break
+                else:
+                    if worker_id in disk_monitor.paused_workers:
+                        logger.info(f"下载Worker {worker_id}: 磁盘空间恢复，继续下载")
+                        disk_monitor.paused_workers.discard(worker_id)
         except Exception as e:
             logger.error(f"下载Worker {worker_id} 检查磁盘空间时异常: {e}")
-            await asyncio.sleep(60)
+            if not getattr(app, 'force_exit', False):
+                await asyncio.sleep(60)
             continue
 
         try:
