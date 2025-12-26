@@ -89,6 +89,78 @@ class ColorFormatter(logging.Formatter):
         return super().format(record)
 
 
+# 定义通知级别映射
+BARK_LEVELS = {
+    "active": "active",  # 活跃通知（默认）
+    "timeSensitive": "timeSensitive",  # 时效性通知
+    "passive": "passive"  # 被动通知（静默）
+}
+
+# 定义不同通知类型的默认分组和级别
+NOTIFICATION_CONFIGS = {
+    "startup": {
+        "group": "系统状态",
+        "level": "active"
+    },
+    "shutdown": {
+        "group": "系统状态",
+        "level": "active"
+    },
+    "stats_summary": {
+        "group": "统计报告",
+        "level": "passive"
+    },
+    "task_paused": {
+        "group": "任务状态",
+        "level": "timeSensitive"
+    },
+    "disk_space": {
+        "group": "系统警告",
+        "level": "active"
+    },
+    "queue_full": {
+        "group": "系统警告",
+        "level": "timeSensitive"
+    },
+    "queue_status": {
+        "group": "统计报告",
+        "level": "passive"
+    },
+    "failed_task": {
+        "group": "任务状态",
+        "level": "passive"
+    },
+    "test": {
+        "group": "测试",
+        "level": "passive"
+    }
+}
+
+
+def get_notification_config(event_type: str) -> dict:
+    """获取指定事件类型的通知配置"""
+    default_config = {
+        "group": None,  # 使用全局默认
+        "level": None  # 使用全局默认
+    }
+
+    # 首先检查配置文件中的事件配置
+    bark_config = getattr(app, 'bark_notification', {})
+    event_configs = bark_config.get('event_configs', {})
+
+    if event_type in event_configs:
+        config = event_configs[event_type]
+        return {
+            "group": config.get("group"),
+            "level": config.get("level")
+        }
+
+    # 然后检查内置的默认配置
+    if event_type in NOTIFICATION_CONFIGS:
+        return NOTIFICATION_CONFIGS[event_type]
+
+    return default_config
+
 CONFIG_NAME = "config.yaml"
 DATA_FILE_NAME = "data.yaml"
 APPLICATION_NAME = "media_downloader"
@@ -164,8 +236,15 @@ async def check_disk_space(threshold_gb: float = 10.0) -> tuple:
         return False, 0, 0
 
 
-async def send_bark_notification_sync(title: str, body: str, url: str = None, max_retries: int = 2):
-    """实际的Bark通知发送函数，带重试机制"""
+async def send_bark_notification_sync(
+        title: str,
+        body: str,
+        url: str = None,
+        group: str = None,
+        level: str = None,
+        max_retries: int = 2
+):
+    """实际的Bark通知发送函数，支持分组和级别"""
     if not url:
         bark_config = getattr(app, 'bark_notification', {})
         if not bark_config.get('enabled', False):
@@ -180,12 +259,30 @@ async def send_bark_notification_sync(title: str, body: str, url: str = None, ma
     if not url.startswith('http'):
         url = f"https://{url}"
 
+    # 获取默认的group和level
+    bark_config = getattr(app, 'bark_notification', {})
+    default_group = bark_config.get('default_group', 'TelegramDownloader')
+    default_level = bark_config.get('default_level', 'active')
+
+    # 构建payload
     payload = {
         "title": title[:100],  # 限制标题长度
         "body": body[:500],  # 限制正文长度
         "sound": "alarm",
         "icon": "https://telegram.org/img/t_logo.png"
     }
+
+    # 添加group参数（如果提供了则使用，否则使用默认值）
+    if group:
+        payload["group"] = group
+    elif default_group:
+        payload["group"] = default_group
+
+    # 添加level参数（如果提供了则使用，否则使用默认值）
+    if level:
+        payload["level"] = level
+    elif default_level:
+        payload["level"] = default_level
 
     # 重试机制
     for retry in range(max_retries + 1):
@@ -194,7 +291,8 @@ async def send_bark_notification_sync(title: str, body: str, url: str = None, ma
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, json=payload, timeout=timeout) as response:
                     if response.status == 200:
-                        logger.debug(f"Bark通知发送成功: {title}")
+                        logger.debug(
+                            f"Bark通知发送成功: {title}, group={payload.get('group')}, level={payload.get('level')}")
                         return True
                     else:
                         response_text = await response.text()
@@ -224,17 +322,25 @@ async def send_bark_notification_sync(title: str, body: str, url: str = None, ma
     return False
 
 
-async def send_bark_notification(title: str, body: str, url: str = None):
-    """发送Bark通知（放入通知队列）"""
+async def send_bark_notification(
+    title: str,
+    body: str,
+    url: str = None,
+    group: str = None,
+    level: str = None
+):
+    """发送Bark通知（放入通知队列），支持分组和级别"""
     try:
         # 将通知任务放入队列
         await notify_queue.put({
             'type': 'bark_notification',
             'title': title,
             'body': body,
-            'url': url
+            'url': url,
+            'group': group,
+            'level': level
         })
-        logger.debug(f"已添加通知任务到队列: {title}")
+        logger.debug(f"已添加通知任务到队列: {title}, group={group}, level={level}")
         return True
     except asyncio.QueueFull:
         logger.warning("通知队列已满，丢弃通知")
@@ -262,12 +368,14 @@ async def notify_worker(worker_id: int):
                 title = task.get('title')
                 body = task.get('body')
                 url = task.get('url')
+                group = task.get('group')
+                level = task.get('level')
 
-                logger.debug(f"通知Worker {worker_id} 处理Bark通知: {title}")
+                logger.debug(f"通知Worker {worker_id} 处理Bark通知: {title}, group={group}, level={level}")
 
                 # 实际发送通知
                 try:
-                    success = await send_bark_notification_sync(title, body, url)
+                    success = await send_bark_notification_sync(title, body, url, group, level)
                     if success:
                         logger.debug(f"通知Worker {worker_id}: {title} 发送成功")
                     else:
@@ -292,7 +400,6 @@ async def notify_worker(worker_id: int):
                 pass
             await asyncio.sleep(1)
 
-    # 确保worker退出时清理队列
     logger.debug(f"通知Worker {worker_id} 退出")
 
 
@@ -323,7 +430,8 @@ async def disk_space_monitor_task():
                 f"阈值: {threshold_gb}GB\n"
                 f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             )
-            success = await send_bark_notification("磁盘空间监控启动", message)
+            # 使用事件类型发送通知
+            success = await send_event_notification("disk_space", "磁盘空间监控启动", message)
             if success:
                 logger.success("磁盘空间监控启动通知发送成功")
             else:
@@ -335,7 +443,8 @@ async def disk_space_monitor_task():
                 f"阈值: {threshold_gb}GB\n"
                 f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             )
-            success = await send_bark_notification("磁盘空间警告", message)
+            # 使用事件类型发送通知
+            success = await send_event_notification("disk_space", "磁盘空间警告", message)
             if success:
                 logger.warning("磁盘空间警告通知发送成功")
             else:
@@ -369,7 +478,8 @@ async def disk_space_monitor_task():
                         f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                     )
 
-                    if await send_bark_notification("磁盘空间警告", message):
+                    # 使用事件类型发送通知
+                    if await send_event_notification("disk_space", "磁盘空间警告", message):
                         disk_monitor.last_notification_time = current_time
             else:
                 if disk_monitor.space_low:
@@ -379,7 +489,8 @@ async def disk_space_monitor_task():
                         f"可用空间: {available_gb}GB / {total_gb}GB\n"
                         f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                     )
-                    await send_bark_notification("磁盘空间恢复", message)
+                    # 使用事件类型发送通知
+                    await send_event_notification("disk_space", "磁盘空间恢复", message)
 
                     if disk_monitor.paused_workers:
                         logger.info("磁盘空间恢复，准备恢复下载任务...")
@@ -387,7 +498,7 @@ async def disk_space_monitor_task():
 
         except Exception as e:
             logger.error(f"磁盘空间监控任务出错: {e}")
-            await asyncio.sleep(60)  # 出错后等待一段时间再继续
+            await asyncio.sleep(60)
 
 
 async def stats_notification_task():
@@ -407,7 +518,7 @@ async def stats_notification_task():
 
     # 启动时立即执行一次
     try:
-        stats = await collect_stats_async()  # 使用异步版本
+        stats = await collect_stats_async()
         if stats:
             message = (
                 f"📊 统计摘要（启动测试）\n"
@@ -422,7 +533,8 @@ async def stats_notification_task():
                 f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             )
 
-            success = await send_bark_notification("启动测试通知", message)
+            # 使用事件类型发送通知
+            success = await send_event_notification("stats_summary", "启动测试通知", message)
             if success:
                 logger.success("启动测试通知发送成功")
             else:
@@ -449,7 +561,7 @@ async def stats_notification_task():
         try:
             await asyncio.sleep(interval)
 
-            stats = await collect_stats_async()  # 使用异步版本
+            stats = await collect_stats_async()
             if not stats:
                 logger.warning("收集统计信息失败，跳过本次通知")
                 continue
@@ -468,7 +580,8 @@ async def stats_notification_task():
                 f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             )
 
-            await send_bark_notification("下载统计", message)
+            # 使用事件类型发送通知
+            await send_event_notification("stats_summary", "下载统计", message)
 
             # 重置统计
             disk_monitor.stats_since_last_notification = {
@@ -479,8 +592,7 @@ async def stats_notification_task():
             }
         except Exception as e:
             logger.error(f"统计通知任务出错: {e}")
-            # 继续运行，不中断任务
-            await asyncio.sleep(60)  # 出错后等待一段时间再继续
+            await asyncio.sleep(60)
 
 
 def run_async_sync(coroutine, loop=None, timeout=10):
@@ -959,7 +1071,8 @@ async def add_download_task(
                             f"已等待: {int(current_wait_time / 60)}分钟\n"
                             f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                         )
-                        await send_bark_notification("队列满载告警", message_body)
+                        # 使用事件类型发送通知
+                        await send_event_notification("queue_full", "队列满载告警", message_body)
 
                     last_notification_time = current_time
                     logger.warning(
@@ -1891,34 +2004,51 @@ async def queue_monitor_task():
             bark_config = getattr(app, 'bark_notification', {})
             events_to_notify = bark_config.get('events_to_notify', [])
 
-            if 'queue_status' not in events_to_notify:
-                continue
+            # 检查队列状态报告
+            if 'queue_status' in events_to_notify:
+                current_size = download_queue.qsize()
+                queue_capacity = queue_manager.download_batch_size
 
-            current_size = download_queue.qsize()
-            queue_capacity = queue_manager.download_batch_size
+                # 如果队列长时间满载（超过80%容量），发送状态报告
+                if current_size > queue_capacity * 0.8:
+                    active_workers = 0
+                    for _, value in app.chat_download_config.items():
+                        if value.node and value.node.download_status:
+                            active_workers += sum(1 for status in value.node.download_status.values()
+                                                  if status == DownloadStatus.Downloading)
 
-            # 如果队列长时间满载（超过80%容量），发送状态报告
-            if current_size > queue_capacity * 0.8:
-                active_workers = 0
-                for _, value in app.chat_download_config.items():
-                    if value.node and value.node.download_status:
-                        active_workers += sum(1 for status in value.node.download_status.values()
-                                              if status == DownloadStatus.Downloading)
+                    message = (
+                        f"📊 队列状态报告\n"
+                        f"队列使用率: {current_size}/{queue_capacity} ({int(current_size / queue_capacity * 100)}%)\n"
+                        f"活动worker数: {active_workers}\n"
+                        f"暂停worker数: {len(disk_monitor.paused_workers)}\n"
+                        f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    )
 
-                message = (
-                    f"📊 队列状态报告\n"
-                    f"队列使用率: {current_size}/{queue_capacity} ({int(current_size / queue_capacity * 100)}%)\n"
-                    f"活动worker数: {active_workers}\n"
-                    f"暂停worker数: {len(disk_monitor.paused_workers)}\n"
-                    f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                )
-
-                await send_bark_notification("队列状态", message)
+                    # 使用事件类型发送通知
+                    await send_event_notification("queue_status", "队列状态", message)
 
         except Exception as e:
             logger.error(f"队列监控任务出错: {e}")
             await asyncio.sleep(60)
 
+
+async def send_event_notification(event_type: str, title: str, body: str, custom_group: str = None,
+                                  custom_level: str = None):
+    """发送事件通知，根据事件类型使用不同的分组和级别"""
+    # 获取事件类型的默认配置
+    event_config = get_notification_config(event_type)
+
+    # 使用自定义配置或事件默认配置
+    group = custom_group or event_config.get("group")
+    level = custom_level or event_config.get("level")
+
+    # 验证level有效性
+    if level and level not in BARK_LEVELS:
+        logger.warning(f"无效的通知级别: {level}，使用默认值")
+        level = None
+
+    return await send_bark_notification(title, body, group=group, level=level)
 
 def main():
     """主函数"""
@@ -2006,7 +2136,7 @@ def main():
                 logger.info("开始测试所有通知功能...")
 
                 # 测试基本通知
-                test_success = await send_bark_notification("测试通知", "Telegram媒体下载器启动测试成功！")
+                test_success = await send_event_notification("test", "测试通知", "Telegram媒体下载器启动测试成功！")
                 if test_success:
                     logger.success("基本通知测试成功")
                 else:
@@ -2025,7 +2155,7 @@ def main():
                     else:
                         test_msg = f"磁盘空间检查测试：可用 {available_gb}GB，不足"
 
-                    test_success = await send_bark_notification("磁盘空间测试", test_msg)
+                    test_success = await send_event_notification("test", "磁盘空间测试", test_msg)
                     if test_success:
                         logger.success("磁盘空间检查测试成功")
                     else:
@@ -2041,10 +2171,11 @@ def main():
             logger.info("Bark通知未启用，跳过监控任务")
 
         # 发送启动通知
+        # 在 main 函数中找到启动通知部分，修改为：
         if hasattr(app, 'bark_notification') and app.bark_notification.get('enabled', False):
             events_to_notify = app.bark_notification.get('events_to_notify', [])
             if 'startup' in events_to_notify:
-                # 使用辅助函数同步获取失败任务数
+                # 异步获取失败任务数
                 async def get_total_failed_tasks():
                     total = 0
                     for chat_id, _ in app.chat_download_config.items():
@@ -2052,7 +2183,10 @@ def main():
                         total += len(failed_tasks)
                     return total
 
-                total_failed_tasks = run_async_sync(get_total_failed_tasks(), timeout=30)
+                try:
+                    total_failed_tasks = run_async_sync(get_total_failed_tasks(), timeout=30)
+                except:
+                    total_failed_tasks = 0
 
                 startup_msg = (
                     f"✅ Telegram媒体下载器已启动\n"
@@ -2061,7 +2195,9 @@ def main():
                     f"配置聊天数: {len(app.chat_download_config)}\n"
                     f"待重试失败任务: {total_failed_tasks}"
                 )
-                app.loop.create_task(send_bark_notification("程序启动", startup_msg))
+
+                # 使用事件类型发送通知
+                app.loop.create_task(send_event_notification("startup", "程序启动", startup_msg))
 
         app.loop.create_task(download_all_chat(client))
 
