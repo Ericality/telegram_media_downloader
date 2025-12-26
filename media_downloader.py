@@ -1390,7 +1390,8 @@ async def download_worker(client: pyrogram.client.Client, worker_id: int):
                 download_queue.task_done()
                 continue
 
-            logger.debug(f"下载Worker {worker_id} 开始处理消息 {message.id} (聊天: {node.chat_id})")
+            # 只记录处理开始，不记录每个步骤
+            logger.debug(f"下载Worker {worker_id} 处理消息 {message.id}")
 
             try:
                 if node.client:
@@ -1398,7 +1399,8 @@ async def download_worker(client: pyrogram.client.Client, worker_id: int):
                 else:
                     await download_task(client, message, node)
 
-                logger.debug(f"下载Worker {worker_id} 完成处理消息 {message.id}")
+                # 下载完成后记录
+                logger.debug(f"下载Worker {worker_id} 完成消息 {message.id}")
             except asyncio.CancelledError:
                 logger.info(f"下载Worker {worker_id} 被取消，将消息 {message.id} 放回队列")
                 await download_queue.put((message, node))  # 放回队列
@@ -1407,13 +1409,11 @@ async def download_worker(client: pyrogram.client.Client, worker_id: int):
                 logger.error(f"下载Worker {worker_id}: 消息 {message.id} 网络连接错误: {e}")
                 # 记录失败任务，下次重试
                 retry_count = await record_failed_task(node.chat_id, message.id, f"网络错误: {str(e)}")
-                node.download_status[message.id] = DownloadStatus.FailedDownload
                 logger.warning(f"消息 {message.id} 网络错误，已记录到失败列表（重试次数: {retry_count}）")
             except Exception as e:
                 logger.error(f"下载Worker {worker_id}: 消息 {message.id} 下载任务异常: {e}")
                 # 记录失败任务，下次重试
                 retry_count = await record_failed_task(node.chat_id, message.id, f"下载异常: {str(e)}")
-                node.download_status[message.id] = DownloadStatus.FailedDownload
                 logger.warning(f"消息 {message.id} 下载异常，已记录到失败列表（重试次数: {retry_count}）")
             finally:
                 download_queue.task_done()
