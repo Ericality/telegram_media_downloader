@@ -906,105 +906,123 @@ async def _get_media_meta(
 async def add_download_task(
         message: pyrogram.types.Message,
         node: TaskNode,
-        max_wait_time: int = 600  # 最大等待时间（秒）
+        max_wait_time: int = 3600  # 默认最长等待1小时，超时后告警但继续等待
 ) -> bool:
-    """添加下载任务到队列（队列满时等待）"""
+    """添加下载任务到队列（队列满时无限等待）"""
     if message.empty:
         return False
 
     start_time = time.time()
-    retry_count = 0
+    last_notification_time = 0
+    notification_interval = 3600  # 每1小时发送一次告警
 
     while getattr(app, 'is_running', True) and not getattr(app, 'force_exit', False):
         try:
-            async with queue_manager.lock:
-                current_size = download_queue.qsize()
+            # 检查队列是否有空位
+            current_size = download_queue.qsize()
+            queue_capacity = queue_manager.download_batch_size
 
-                # 如果队列有空间，添加任务
-                if current_size < queue_manager.download_batch_size:
-                    node.download_status[message.id] = DownloadStatus.Downloading
-                    await download_queue.put((message, node))
-                    node.total_task += 1
-                    queue_manager.task_added += 1
+            if current_size < queue_capacity:
+                # 有空位，添加任务
+                async with queue_manager.lock:
+                    if current_size < queue_capacity:  # 双重检查
+                        node.download_status[message.id] = DownloadStatus.Downloading
+                        await download_queue.put((message, node))
+                        node.total_task += 1
+                        queue_manager.task_added += 1
 
-                    logger.debug(f"已添加下载任务: message_id={message.id}, 队列大小={download_queue.qsize()}")
-                    return True
-                else:
-                    # 队列满了，等待
-                    wait_time = min(2 ** retry_count, 5)  # 指数退避，最多5秒
-                    logger.debug(
-                        f"下载队列已满({current_size}/{queue_manager.download_batch_size})，等待 {wait_time} 秒后重试...")
-                    retry_count += 1
-                    await asyncio.sleep(wait_time)
+                        logger.debug(
+                            f"已添加下载任务: message_id={message.id}, 队列大小={download_queue.qsize()}/{queue_capacity}")
+                        return True
 
-            # 检查是否超时
-            if time.time() - start_time > max_wait_time:
-                logger.warning(f"添加下载任务超时: message_id={message.id}，等待 {max_wait_time} 秒后仍未有空闲队列")
+            # 队列满，等待
+            current_wait_time = time.time() - start_time
 
-                # 记录到失败列表，等待后续重试
-                await record_failed_task(node.chat_id, message.id, f"队列满，等待{max_wait_time}秒后超时")
-                return False
+            # 如果等待时间超过30秒，每30秒记录一次等待状态
+            if current_wait_time > 30 and int(current_wait_time) % 30 == 0:
+                logger.debug(f"队列满，等待任务添加: message_id={message.id}, 已等待{int(current_wait_time)}秒")
+
+            # 如果等待时间超过1小时，发送告警通知（每小时一次）
+            if current_wait_time > max_wait_time:
+                current_time = time.time()
+                if current_time - last_notification_time > notification_interval:
+                    bark_config = getattr(app, 'bark_notification', {})
+                    events_to_notify = bark_config.get('events_to_notify', [])
+
+                    if 'queue_full' in events_to_notify:
+                        message_body = (
+                            f"⚠️ 下载队列长时间满载\n"
+                            f"消息ID: {message.id}\n"
+                            f"聊天ID: {node.chat_id}\n"
+                            f"队列容量: {queue_capacity}\n"
+                            f"当前队列: {current_size}\n"
+                            f"已等待: {int(current_wait_time / 60)}分钟\n"
+                            f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                        )
+                        await send_bark_notification("队列满载告警", message_body)
+
+                    last_notification_time = current_time
+                    logger.warning(
+                        f"任务添加等待时间过长: message_id={message.id}, 已等待{int(current_wait_time / 60)}分钟")
+
+            # 等待一段时间再检查
+            await asyncio.sleep(1)
 
         except asyncio.CancelledError:
             logger.info(f"添加任务被取消: message_id={message.id}")
+            # 如果被取消，记录到失败列表，等待后续重试
+            await record_failed_task(node.chat_id, message.id, "添加任务被取消")
             return False
         except Exception as e:
             logger.error(f"添加下载任务异常: {e}")
 
             # 检查是否要退出
             if getattr(app, 'force_exit', False):
-                logger.debug(f"程序正在退出，放弃添加任务: message_id={message.id}")
+                logger.debug(f"程序正在退出，记录失败任务: message_id={message.id}")
+                await record_failed_task(node.chat_id, message.id, f"程序退出: {e}")
                 return False
 
-            # 等待后重试
-            await asyncio.sleep(1)
+            # 等待后继续尝试
+            await asyncio.sleep(5)
 
-    logger.debug(f"程序停止运行，放弃添加任务: message_id={message.id}")
+    # 程序停止运行
+    logger.debug(f"程序停止，记录失败任务: message_id={message.id}")
+    await record_failed_task(node.chat_id, message.id, "程序停止运行")
     return False
 
 
 async def add_download_task_batch(
         messages: List[pyrogram.types.Message],
         node: TaskNode,
-        batch_size: int = None,
-        timeout_per_task: int = 30  # 每个任务的超时时间
+        max_concurrent: int = 5  # 并发添加的任务数
 ) -> int:
-    """批量添加下载任务（带超时控制）"""
-    if batch_size is None:
-        batch_size = queue_manager.download_batch_size
-
+    """批量添加下载任务（使用并发控制）"""
     added_count = 0
     failed_count = 0
 
-    for message in messages:
-        try:
-            # 设置超时控制
-            try:
-                # 使用 asyncio.wait_for 设置每个任务的超时
-                task = asyncio.create_task(add_download_task(message, node, timeout_per_task))
-                success = await asyncio.wait_for(task, timeout=timeout_per_task + 5)
+    # 使用信号量控制并发
+    semaphore = asyncio.Semaphore(max_concurrent)
 
+    async def add_single_task(msg):
+        """添加单个任务的协程"""
+        nonlocal added_count, failed_count
+        try:
+            async with semaphore:
+                success = await add_download_task(msg, node)
                 if success:
                     added_count += 1
                 else:
                     failed_count += 1
-                    logger.warning(f"添加任务失败: message_id={message.id}")
-            except asyncio.TimeoutError:
-                logger.warning(f"添加任务超时: message_id={message.id}")
-                await record_failed_task(node.chat_id, message.id, f"添加任务超时（{timeout_per_task}秒）")
-                failed_count += 1
-
         except Exception as e:
-            logger.error(f"批量添加任务时异常 (message_id={message.id}): {e}")
+            logger.error(f"添加任务失败: message_id={msg.id}, 错误: {e}")
             failed_count += 1
+            await record_failed_task(node.chat_id, msg.id, f"批量添加异常: {e}")
 
-        # 如果达到批量大小，等待队列处理一部分
-        if added_count >= batch_size:
-            logger.debug(f"已添加批量任务 {added_count} 个，等待队列处理...")
+    # 创建所有任务
+    tasks = [add_single_task(msg) for msg in messages]
 
-            # 等待队列大小减少到一半以下
-            while download_queue.qsize() > batch_size // 2:
-                await asyncio.sleep(1)
+    # 等待所有任务完成
+    await asyncio.gather(*tasks, return_exceptions=True)
 
     if failed_count > 0:
         logger.warning(f"批量添加完成: 成功 {added_count} 个，失败 {failed_count} 个")
@@ -1863,6 +1881,45 @@ def check_config_consistency(app):
     return issues
 
 
+async def queue_monitor_task():
+    """队列监控任务，检测队列长时间满载情况"""
+    while getattr(app, 'is_running', True):
+        try:
+            # 每5分钟检查一次
+            await asyncio.sleep(300)
+
+            bark_config = getattr(app, 'bark_notification', {})
+            events_to_notify = bark_config.get('events_to_notify', [])
+
+            if 'queue_status' not in events_to_notify:
+                continue
+
+            current_size = download_queue.qsize()
+            queue_capacity = queue_manager.download_batch_size
+
+            # 如果队列长时间满载（超过80%容量），发送状态报告
+            if current_size > queue_capacity * 0.8:
+                active_workers = 0
+                for _, value in app.chat_download_config.items():
+                    if value.node and value.node.download_status:
+                        active_workers += sum(1 for status in value.node.download_status.values()
+                                              if status == DownloadStatus.Downloading)
+
+                message = (
+                    f"📊 队列状态报告\n"
+                    f"队列使用率: {current_size}/{queue_capacity} ({int(current_size / queue_capacity * 100)}%)\n"
+                    f"活动worker数: {active_workers}\n"
+                    f"暂停worker数: {len(disk_monitor.paused_workers)}\n"
+                    f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+
+                await send_bark_notification("队列状态", message)
+
+        except Exception as e:
+            logger.error(f"队列监控任务出错: {e}")
+            await asyncio.sleep(60)
+
+
 def main():
     """主函数"""
     setup_exit_signal_handlers()
@@ -1937,7 +1994,11 @@ def main():
             stats_task_obj = app.loop.create_task(stats_notification_task())
             monitor_tasks.append(stats_task_obj)
 
-            logger.info("磁盘空间监控和统计通知已启用")
+            # 启动队列监控
+            queue_monitor_obj = app.loop.create_task(queue_monitor_task())
+            monitor_tasks.append(queue_monitor_obj)
+
+            logger.info("磁盘空间监控、统计通知和队列监控已启用")
 
             # 在启动后立即测试通知功能
             async def test_all_notifications():
