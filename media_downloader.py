@@ -1501,16 +1501,29 @@ async def add_download_task(
                         # 标记为下载中
                         node.download_status[message.id] = DownloadStatus.Downloading
                         # 立即更新聊天配置的 last_read_message_id
-                        chat_config = app.chat_download_config.get(node.chat_id)
-                        if chat_config:
-                            # 确保 message.id 是整数
-                            message_id_int = int(message.id)
-                            current_last_id = int(getattr(chat_config, 'last_read_message_id', 0))
+                        chat_id_str = str(node.chat_id)
+                        chat_config = app.chat_download_config.get(node.chat_id) or app.chat_download_config.get(
+                            chat_id_str)
 
-                            # 只向前更新
-                            if message_id_int > current_last_id:
-                                chat_config.last_read_message_id = message_id_int
-                                logger.debug(f"更新聊天 {node.chat_id} 的 last_read_message_id 到 {message_id_int}")
+                        if chat_config:
+                            try:
+                                message_id_int = int(message.id)
+                                current_last_id = getattr(chat_config, 'last_read_message_id', 0)
+
+                                if current_last_id is None:
+                                    current_last_id = 0
+
+                                current_last_id = int(current_last_id)
+
+                                # 只向前更新
+                                if message_id_int > current_last_id:
+                                    chat_config.last_read_message_id = message_id_int
+                                    logger.debug(f"更新聊天 {node.chat_id} 的 last_read_message_id 到 {message_id_int}")
+                                    logger.debug(
+                                        f"聊天配置: {chat_id_str}, 消息ID: {message.id}, 类型: {type(message.id)}")
+                            except (ValueError, TypeError) as e:
+                                logger.error(
+                                    f"更新 last_read_message_id 时出错: {e}, chat_id={node.chat_id}, message_id={message.id}")
 
                         # 添加任务到队列
                         await download_queue.put((message, node))
@@ -1586,13 +1599,25 @@ async def add_download_task_batch(
     failed_count = 0
 
     # 找到这些消息中最大的ID，立即更新进度
-    max_message_id = max(msg.id for msg in messages if msg)
-    chat_config = app.chat_download_config.get(node.chat_id)
-    if chat_config:
-        current_last_id = int(getattr(chat_config, 'last_read_message_id', 0))
-        if max_message_id > current_last_id:
-            chat_config.last_read_message_id = max_message_id
-            logger.debug(f"批量更新聊天 {node.chat_id} 的 last_read_message_id 到 {max_message_id}")
+    if messages:
+        try:
+            max_message_id = max(int(msg.id) for msg in messages if msg)
+            chat_id_str = str(node.chat_id)
+            chat_config = app.chat_download_config.get(node.chat_id) or app.chat_download_config.get(chat_id_str)
+
+            if chat_config:
+                current_last_id = getattr(chat_config, 'last_read_message_id', 0)
+                if current_last_id is None:
+                    current_last_id = 0
+
+                current_last_id = int(current_last_id)
+
+                if max_message_id > current_last_id:
+                    chat_config.last_read_message_id = max_message_id
+                    logger.info(
+                        f"📈 批量更新聊天 {node.chat_id} 的 last_read_message_id: {current_last_id} -> {max_message_id}")
+        except Exception as e:
+            logger.error(f"批量更新进度时出错: {e}")
 
     # 使用信号量控制并发
     semaphore = asyncio.Semaphore(max_concurrent)
@@ -1601,7 +1626,6 @@ async def add_download_task_batch(
         """添加单个任务的协程"""
         nonlocal added_count, failed_count
 
-        # 检查程序是否在运行
         if not getattr(app, 'is_running', True) or getattr(app, 'force_exit', False):
             logger.debug(f"程序不在运行状态，跳过任务: message_id={msg.id}")
             failed_count += 1
@@ -1628,7 +1652,6 @@ async def add_download_task_batch(
         await asyncio.gather(*tasks, return_exceptions=True)
     except asyncio.CancelledError:
         logger.warning("批量添加任务被取消")
-        # 记录剩余未处理的任务
         for msg in messages[added_count + failed_count:]:
             if msg:
                 await record_failed_task(node.chat_id, msg.id, "批量添加被取消")
@@ -2839,16 +2862,35 @@ def main():
         except:
             pass
 
+        # 打印当前聊天配置状态
+        logger.info("当前聊天配置状态:")
+        for chat_id, chat_config in app.chat_download_config.items():
+            logger.info(
+                f"  - 聊天 {chat_id}: last_read_message_id={getattr(chat_config, 'last_read_message_id', '未设置')}, "
+                f"类型={type(getattr(chat_config, 'last_read_message_id', '无'))}")
+
         logger.info(f"{_t('update config')}......")
         try:
             # 尝试更新配置
             success = app.update_config()
             if success:
                 logger.success(f"{_t('Updated last read message_id to config file')}")
+
+                # 读取并显示更新后的配置
+                if os.path.exists(CONFIG_NAME):
+                    with open(CONFIG_NAME, 'r', encoding='utf-8') as f:
+                        updated_config = yaml.safe_load(f)
+                        if updated_config and 'chat' in updated_config:
+                            logger.info("更新后的聊天配置:")
+                            for chat_item in updated_config['chat']:
+                                logger.info(f"  - chat_id: {chat_item.get('chat_id')}, "
+                                            f"last_read_message_id: {chat_item.get('last_read_message_id')}")
             else:
                 logger.warning(f"配置更新可能失败，请检查日志")
         except Exception as e:
             logger.error(f"保存配置时出错: {e}")
+            import traceback
+            logger.error(f"堆栈信息: {traceback.format_exc()}")
 
         # 检查配置文件大小
         try:
