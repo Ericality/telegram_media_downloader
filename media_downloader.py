@@ -10,6 +10,7 @@ import sys
 import time
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple, Union, Dict, Any, Callable
+from pathlib import Path
 
 import aiohttp
 import psutil
@@ -52,7 +53,7 @@ custom_theme = Theme({
 })
 console = Console(theme=custom_theme)
 
-# 配置RichHandler
+# 配置RichHandler - 初始设为INFO，后面会根据配置调整
 rich_handler = RichHandler(
     console=console,
     rich_tracebacks=True,
@@ -60,11 +61,12 @@ rich_handler = RichHandler(
     show_time=True,
     show_path=False,
     tracebacks_show_locals=False,
-    level=logging.DEBUG if os.environ.get("DEBUG") else logging.INFO
+    level=logging.INFO  # 先设为INFO，后面会根据配置调整
 )
 
+# 初始使用INFO级别，加载配置后会调整
 logging.basicConfig(
-    level=logging.DEBUG if os.environ.get("DEBUG") else logging.INFO,
+    level=logging.INFO,
     format="%(message)s",
     datefmt="[%X]",
     handlers=[rich_handler],
@@ -339,6 +341,7 @@ class NotificationManager:
             f"失败任务(待重试): {stats.get('failed_tasks_pending', 0)}\n"
             f"下载大小: {stats.get('download_size_mb', 0):.2f}MB\n"
             f"磁盘可用: {stats.get('disk_available_gb', 0):.2f}GB/{stats.get('disk_total_gb', 0):.2f}GB\n"
+            f"下载目录大小: {stats.get('download_dir_size_gb', 0):.2f}GB\n"  # 新增这一行
             f"活动任务: {stats.get('active_tasks', 0)}\n"
             f"队列任务: {stats.get('queued_tasks', 0)}\n"
             f"空间不足: {'是' if stats.get('space_low', False) else '否'}"
@@ -1025,15 +1028,32 @@ async def collect_stats_async() -> Dict[str, Any]:
             except Exception as e:
                 logger.warning(f"加载失败任务统计失败 ({chat_id}): {e}")
 
+        # 获取下载目录大小（新增部分）- 使用app.save_path
+        download_dir_size_gb = 0
+        try:
+            # 从app.save_path获取下载目录路径
+            download_dir = app.save_path
+
+            if download_dir and os.path.exists(download_dir):
+                # 在单独的线程中计算目录大小，避免阻塞事件循环
+                download_dir_size = await asyncio.to_thread(calculate_directory_size, download_dir)
+                download_dir_size_gb = download_dir_size / (1024 ** 3)  # 转换为GB
+                logger.debug(f"下载目录 {download_dir} 大小: {download_dir_size_gb:.2f}GB")
+            elif download_dir:
+                logger.debug(f"下载目录不存在: {download_dir}")
+        except Exception as e:
+            logger.warning(f"计算下载目录大小失败: {e}")
+
         return {
             "uptime": uptime_str,
             "tasks_completed": tasks_completed,
             "tasks_failed": total_failed_tasks,
             "tasks_skipped": 0,
             "download_size_mb": disk_monitor.stats_since_last_notification["download_size"] / (
-                        1024 ** 2) if disk_monitor.stats_since_last_notification.get("download_size") else 0,
+                    1024 ** 2) if disk_monitor.stats_since_last_notification.get("download_size") else 0,
             "disk_available_gb": available_gb,
             "disk_total_gb": total_gb,
+            "download_dir_size_gb": download_dir_size_gb,  # 新增字段
             "active_tasks": getattr(app, 'max_download_task', 5) - len(disk_monitor.paused_workers),
             "queued_tasks": queued_tasks,
             "space_low": disk_monitor.space_low,
@@ -1062,6 +1082,33 @@ def collect_stats() -> Dict[str, Any]:
         return {}
 
 
+def calculate_directory_size(directory_path: str) -> int:
+    """
+    计算目录的总大小（字节）
+    """
+    total_size = 0
+    try:
+        path = Path(directory_path)
+
+        if not path.exists() or not path.is_dir():
+            return 0
+
+        # 使用 glob 递归遍历所有文件
+        for file_path in path.rglob('*'):
+            try:
+                if file_path.is_file():
+                    total_size += file_path.stat().st_size
+            except (OSError, PermissionError):
+                # 忽略无法访问的文件
+                continue
+    except Exception as e:
+        logger.warning(f"计算目录大小出错 {directory_path}: {e}")
+
+    return total_size
+
+
+
+
 def setup_exit_signal_handlers():
     """设置优雅退出的信号处理器"""
 
@@ -1084,163 +1131,109 @@ def setup_exit_signal_handlers():
 
 
 async def graceful_shutdown():
-    """优雅关闭所有组件 - 改进版本"""
+    """优雅关闭所有组件"""
     logger.info("开始优雅关闭...")
 
     # 1. 停止添加新任务
-    if hasattr(app, 'is_running'):
-        app.is_running = False
-    if not hasattr(app, 'force_exit'):
-        app.force_exit = True
+    app.is_running = False
+    app.force_exit = True
 
-    # 2. 等待当前活动任务完成（最多等待30秒）
-    logger.info("等待活动任务完成...")
-    wait_start = time.time()
-    max_wait_time = 30
+    # 2. 发送关闭通知（先发送通知，再处理其他关闭逻辑）
+    try:
+        if notification_manager.should_notify("shutdown"):
+            shutdown_title = "程序停止"
+            shutdown_message = (
+                f"🛑 Telegram媒体下载器已停止\n"
+                f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"运行时间: {datetime.now() - disk_monitor.stats_start_time}\n"
+                f"完成任务: {app.total_download_task}"
+            )
 
-    while time.time() - wait_start < max_wait_time:
-        # 检查是否还有活动任务
-        has_active_tasks = False
-        for _, value in app.chat_download_config.items():
-            if value.node and value.node.download_status:
-                downloading_tasks = sum(1 for status in value.node.download_status.values()
-                                        if status == DownloadStatus.Downloading)
-                if downloading_tasks > 0:
-                    has_active_tasks = True
-                    break
+            # 给通知一点时间发送
+            notification_task = asyncio.create_task(
+                notification_manager.send_event_notification("shutdown", shutdown_title, shutdown_message)
+            )
+            await asyncio.wait_for(notification_task, timeout=10)
+            logger.info("关闭通知已发送")
+    except Exception as e:
+        logger.error(f"发送关闭通知失败: {e}")
 
-        if not has_active_tasks and download_queue.empty():
-            logger.info("所有活动任务已完成")
-            break
+    # 3. 等待一小段时间让生产者停止
+    await asyncio.sleep(1)
 
-        await asyncio.sleep(1)
-
-    # 3. 记录剩余的未完成任务到失败列表（而不是配置）
-    logger.info("记录未完成任务...")
+    # 3. 记录所有正在下载的任务和队列中的任务到失败列表
     pending_messages = []
 
-    # 清空下载队列，记录到失败任务文件
+    # 记录所有正在下载的任务
+    for chat_id, chat_config in app.chat_download_config.items():
+        if chat_config.node and chat_config.node.download_status:
+            for message_id, status in chat_config.node.download_status.items():
+                if status == DownloadStatus.Downloading:
+                    pending_messages.append((message_id, chat_id))
+                    logger.debug(f"记录正在下载的任务: chat_id={chat_id}, message_id={message_id}")
+
+    # 记录队列中的任务
     try:
         while not download_queue.empty():
             try:
                 message, node = download_queue.get_nowait()
                 pending_messages.append((message.id, node.chat_id))
                 download_queue.task_done()
+                logger.debug(f"记录队列中的任务: chat_id={node.chat_id}, message_id={message.id}")
             except (asyncio.QueueEmpty, ValueError):
                 break
     except Exception as e:
         logger.error(f"清空下载队列时出错: {e}")
 
-    # 将未完成的任务记录到失败任务文件
+    # 记录到失败任务文件
     if pending_messages:
-        logger.warning(f"有 {len(pending_messages)} 个队列任务未完成，已记录到失败列表")
+        logger.warning(f"有 {len(pending_messages)} 个未完成任务需要记录到失败列表")
         for message_id, chat_id in pending_messages:
-            await record_failed_task(chat_id, message_id, "程序退出，队列任务未处理")
+            await record_failed_task(chat_id, message_id, "程序退出，任务未完成")
 
-    # 4. 等待通知发送完成（缩短等待时间）
-    logger.info("等待通知发送完成...")
-    notification_timeout = 3
-    notification_start = time.time()
+    # 4. 发送关闭通知（可选）
+    try:
+        startup_title = "程序停止"
+        startup_message = (
+            f"🛑 Telegram媒体下载器已停止\n"
+            f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"未完成任务: {len(pending_messages)}\n"
+            f"已添加到失败列表，下次启动时重试"
+        )
 
-    while time.time() - notification_start < notification_timeout:
-        if notify_queue.empty():
-            break
-        await asyncio.sleep(0.5)
-
-    # 5. 不发送关闭通知，避免影响配置更新
+        await notification_manager.send_event_notification("shutdown", startup_title, startup_message)
+    except Exception as e:
+        logger.error(f"发送停止通知失败: {e}")
 
     logger.info("优雅关闭完成")
 
 
 async def run_until_all_task_finish():
-    """正常运行直到所有任务完成，并在完成后继续重试失败任务"""
+    """主运行循环：等待新任务完成，然后等待重试生产者（或退出信号）"""
     logger.info("开始主运行循环...")
 
-    # 阶段1：处理所有新任务
+    # 等待新任务完成（生产者已完成添加）
     while True:
-        # 检查是否要退出
         if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
             logger.info("收到退出信号，准备退出...")
             break
 
-        finish: bool = True
+        all_new_tasks_done = True
         for _, value in app.chat_download_config.items():
             if not value.need_check or value.total_task != value.finish_task:
-                finish = False
+                all_new_tasks_done = False
+                break
 
-        if (not app.bot_token and finish) or getattr(app, 'restart_program', False):
+        if all_new_tasks_done:
+            logger.info("所有新任务已完成")
             break
 
         await asyncio.sleep(1)
 
-    # 阶段2：重试失败任务（无限重试直到成功）
-    if getattr(app, 'is_running', True) and not getattr(app, 'force_exit', False):
-        logger.info("进入失败任务重试阶段...")
-
-        # 无限循环重试失败任务
-        while getattr(app, 'is_running', True) and not getattr(app, 'force_exit', False):
-            try:
-                # 检查是否有任何活动任务
-                has_active_tasks = False
-                for _, value in app.chat_download_config.items():
-                    if value.node and value.node.download_status:
-                        downloading_tasks = sum(1 for status in value.node.download_status.values()
-                                                if status == DownloadStatus.Downloading)
-                        if downloading_tasks > 0:
-                            has_active_tasks = True
-                            break
-
-                # 如果没有活动任务，尝试重试失败任务
-                if not has_active_tasks and download_queue.empty():
-                    # 为每个聊天重试失败任务
-                    total_retried = 0
-                    total_failed_tasks = 0
-
-                    for chat_id, value in app.chat_download_config.items():
-                        if value.node:
-                            # 加载失败任务数量
-                            failed_tasks = await load_failed_tasks(chat_id)
-                            total_failed_tasks += len(failed_tasks)
-
-                            if failed_tasks:
-                                logger.info(f"聊天 {chat_id} 有 {len(failed_tasks)} 个失败任务，开始重试...")
-
-                                # 每次重试一批（避免一次性添加太多）
-                                retried, added = await retry_failed_tasks(
-                                    value.node.client if value.node.client else client,
-                                    chat_id,
-                                    value.node,
-                                    max_batch=queue_manager.max_download_tasks * 2  # 根据worker数量调整
-                                )
-
-                                total_retried += retried
-
-                                if added > 0:
-                                    logger.info(f"已为聊天 {chat_id} 添加 {added} 个失败任务重试")
-                                    # 等待一段时间让新任务开始处理
-                                    await asyncio.sleep(5)
-
-                    # 如果没有任何失败任务需要重试，等待一段时间再检查
-                    if total_failed_tasks == 0:
-                        logger.info("当前没有失败任务需要重试，等待30秒后再次检查...")
-                        await asyncio.sleep(30)
-                    elif total_retried == 0:
-                        logger.info("尝试重试失败任务但未能获取消息，等待30秒后重试...")
-                        await asyncio.sleep(30)
-                    else:
-                        logger.info(f"本轮重试了 {total_retried} 个失败任务，等待处理完成...")
-                        await asyncio.sleep(10)
-                else:
-                    # 还有活动任务，等待
-                    await asyncio.sleep(5)
-
-                # 检查是否需要重启或停止
-                if getattr(app, 'restart_program', False) or getattr(app, 'force_exit', False):
-                    break
-
-            except Exception as e:
-                logger.error(f"重试失败任务循环中出错: {e}")
-                await asyncio.sleep(30)
+    # 新任务完成后，程序继续运行（重试生产者仍在工作），直到收到退出信号
+    while getattr(app, 'is_running', True) and not getattr(app, 'force_exit', False):
+        # 可以定期打印统计信息或休眠
+        await asyncio.sleep(10)
 
     logger.info("主运行循环结束")
 
@@ -1479,148 +1472,153 @@ async def _get_media_meta(
 async def add_download_task(
         message: pyrogram.types.Message,
         node: TaskNode,
-        max_wait_time: int = 3600  # 默认最长等待1小时，超时后告警但继续等待
+        is_retry: bool = False,               # 新增参数，标记是否为重试任务
+        max_wait_time: int = 3600
 ) -> bool:
-    """添加下载任务到队列（队列满时无限等待）"""
+    """添加下载任务到队列，使用 Queue.put 阻塞"""
     if message.empty:
         return False
 
     start_time = time.time()
     last_notification_time = 0
-    notification_interval = 3600  # 每1小时发送一次告警
 
     while True:
-        # 首先检查是否要退出
         if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
             logger.debug(f"程序正在退出，跳过添加任务: message_id={message.id}")
             return False
 
         try:
-            # 检查队列是否有空位
-            current_size = download_queue.qsize()
-            queue_capacity = queue_manager.download_queue_size  # 使用新的队列大小
+            await asyncio.wait_for(download_queue.put((message, node)), timeout=1.0)
 
-            if current_size < queue_capacity:
-                # 有空位，添加任务
-                async with queue_manager.lock:
-                    if current_size < queue_capacity:  # 双重检查
-                        # 再次检查是否要退出
-                        if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
-                            logger.debug(f"程序正在退出，跳过添加任务: message_id={message.id}")
-                            return False
+            async with queue_manager.lock:
+                node.download_status[message.id] = DownloadStatus.Downloading
+                node.total_task += 1
+                queue_manager.task_added += 1
 
-                        node.download_status[message.id] = DownloadStatus.Downloading
-                        await download_queue.put((message, node))
-                        node.total_task += 1
-                        queue_manager.task_added += 1
+                # 只有非重试任务才更新 last_read_message_id
+                if not is_retry:
+                    chat_id_str = str(node.chat_id)
+                    chat_config = app.chat_download_config.get(node.chat_id) or app.chat_download_config.get(chat_id_str)
+                    if chat_config:
+                        try:
+                            message_id_int = int(message.id)
+                            current_last_id = getattr(chat_config, 'last_read_message_id', 0)
+                            if current_last_id is None:
+                                current_last_id = 0
+                            current_last_id = int(current_last_id)
+                            if message_id_int > current_last_id:
+                                chat_config.last_read_message_id = message_id_int
+                                logger.debug(f"更新聊天 {node.chat_id} 的 last_read_message_id 到 {message_id_int}")
+                        except (ValueError, TypeError) as e:
+                            logger.error(f"更新 last_read_message_id 时出错: {e}")
 
-                        logger.debug(
-                            f"已添加下载任务: message_id={message.id}, 队列大小={download_queue.qsize()}/{queue_capacity}")
-                        return True
+            logger.debug(f"已添加{'重试' if is_retry else ''}下载任务: message_id={message.id}, 队列大小={download_queue.qsize()}")
+            return True
 
-            # 队列满，等待
+        except asyncio.TimeoutError:
             current_wait_time = time.time() - start_time
+            queue_capacity = queue_manager.download_queue_size
+            current_size = download_queue.qsize()
 
-            # 如果等待时间超过30秒，每30秒记录一次等待状态
             if current_wait_time > 30 and int(current_wait_time) % 30 == 0:
                 logger.debug(f"队列满，等待任务添加: message_id={message.id}, 已等待{int(current_wait_time)}秒")
 
-            # 如果等待时间超过1小时，发送告警通知（每小时一次）
-            if current_wait_time > max_wait_time:
-                current_time = time.time()
-                if current_time - last_notification_time > notification_interval:
-                    # 发送队列满载通知
-                    wait_minutes = int(current_wait_time / 60)
-                    await notification_manager.send_queue_notification(
-                        current_size, queue_capacity, wait_minutes
-                    )
+            if current_wait_time > max_wait_time and current_wait_time - last_notification_time > 3600:
+                wait_minutes = int(current_wait_time / 60)
+                await notification_manager.send_queue_notification(current_size, queue_capacity, wait_minutes)
+                last_notification_time = current_wait_time
+                logger.warning(f"任务添加等待时间过长: message_id={message.id}, 已等待{wait_minutes}分钟")
 
-                    last_notification_time = current_time
-                    logger.warning(f"任务添加等待时间过长: message_id={message.id}, 已等待{wait_minutes}分钟")
-
-            # 等待一段时间再检查，但检查退出状态
-            for _ in range(10):  # 每0.1秒检查一次，总共1秒
-                await asyncio.sleep(0.1)
-                if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
-                    logger.debug(f"程序正在退出，跳过添加任务: message_id={message.id}")
-                    return False
+            continue
 
         except asyncio.CancelledError:
             logger.info(f"添加任务被取消: message_id={message.id}")
-            # 如果被取消，记录到失败列表，等待后续重试
             await record_failed_task(node.chat_id, message.id, "添加任务被取消")
             return False
         except Exception as e:
             logger.error(f"添加下载任务异常: {e}")
+            await record_failed_task(node.chat_id, message.id, f"添加异常: {e}")
+            return False
 
-            # 检查是否要退出
-            if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
-                logger.debug(f"程序正在退出，跳过添加任务: message_id={message.id}")
-                return False
+async def retry_producer(chat_id: Union[int, str], node: TaskNode, client: pyrogram.Client):
+    """
+    重试任务生产者：持续从失败列表取出消息，按比例（每添加4个新任务后添加1个重试任务）添加到队列
+    """
+    retry_ratio = 4
+    new_task_count = 0
 
-            # 等待后继续尝试
+    while getattr(app, 'is_running', True) and not getattr(app, 'force_exit', False):
+        try:
+            if download_queue.qsize() < queue_manager.download_queue_size:
+                if new_task_count >= retry_ratio:
+                    failed_tasks = await load_failed_tasks(chat_id)
+                    if failed_tasks:
+                        task = failed_tasks[0]
+                        msg_id = task['message_id']
+                        try:
+                            msg = await client.get_messages(chat_id, msg_id)
+                            if msg is not None:
+                                success = await add_download_task(msg, node, is_retry=True)
+                                if success:
+                                    await remove_failed_task(chat_id, msg_id)
+                                    logger.info(f"重试生产者: 为聊天 {chat_id} 添加重试任务 {msg_id}")
+                                    new_task_count = 0
+                                else:
+                                    logger.debug(f"重试生产者: 添加重试任务 {msg_id} 失败")
+                            else:
+                                await remove_failed_task(chat_id, msg_id)
+                                logger.warning(f"重试生产者: 消息 {msg_id} 已不存在")
+                        except Exception as e:
+                            logger.error(f"重试生产者: 获取消息 {msg_id} 失败: {e}")
+                    else:
+                        new_task_count = 0
+                else:
+                    await asyncio.sleep(0.5)
+            else:
+                await asyncio.sleep(1)
+            await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            logger.debug(f"重试生产者 {chat_id} 被取消")
+            break
+        except Exception as e:
+            logger.error(f"重试生产者 {chat_id} 异常: {e}")
             await asyncio.sleep(5)
-
-    return False
-
+    logger.info(f"重试生产者 {chat_id} 退出")
 
 async def add_download_task_batch(
         messages: List[pyrogram.types.Message],
         node: TaskNode,
-        max_concurrent: int = 5  # 并发添加的任务数
+
 ) -> int:
-    """批量添加下载任务（使用并发控制）"""
+    """批量添加下载任务（顺序添加，保证队列容量限制）"""
     # 检查程序是否在运行
     if not getattr(app, 'is_running', True) or getattr(app, 'force_exit', False):
         logger.debug("程序不在运行状态，跳过批量添加")
+        for msg in messages:
+            if msg:
+                await record_failed_task(node.chat_id, msg.id, "程序退出，批量添加被跳过")
+        return 0
+
+    if not messages:
         return 0
 
     added_count = 0
-    failed_count = 0
-
-    # 使用信号量控制并发
-    semaphore = asyncio.Semaphore(max_concurrent)
-
-    async def add_single_task(msg):
-        """添加单个任务的协程"""
-        nonlocal added_count, failed_count
-
-        # 检查程序是否在运行
-        if not getattr(app, 'is_running', True) or getattr(app, 'force_exit', False):
-            logger.debug(f"程序不在运行状态，跳过任务: message_id={msg.id}")
-            failed_count += 1
-            await record_failed_task(node.chat_id, msg.id, "程序退出")
-            return
-
+    # 顺序添加每个任务，add_download_task内部会阻塞直到有空位
+    for msg in messages:
+        if msg is None:
+            continue
         try:
-            async with semaphore:
-                success = await add_download_task(msg, node)
-                if success:
-                    added_count += 1
-                else:
-                    failed_count += 1
+            success = await add_download_task(msg, node)
+            if success:
+                added_count += 1
         except Exception as e:
             logger.error(f"添加任务失败: message_id={msg.id}, 错误: {e}")
-            failed_count += 1
             await record_failed_task(node.chat_id, msg.id, f"批量添加异常: {e}")
 
-    # 创建所有任务
-    tasks = [add_single_task(msg) for msg in messages]
-
-    # 等待所有任务完成
-    try:
-        await asyncio.gather(*tasks, return_exceptions=True)
-    except asyncio.CancelledError:
-        logger.warning("批量添加任务被取消")
-        # 记录剩余未处理的任务
-        for msg in messages[added_count + failed_count:]:
-            await record_failed_task(node.chat_id, msg.id, "批量添加被取消")
-
-    if failed_count > 0:
-        logger.warning(f"批量添加完成: 成功 {added_count} 个，失败 {failed_count} 个")
+    if added_count < len(messages):
+        logger.warning(f"批量添加完成: 成功 {added_count} 个，失败 {len(messages) - added_count} 个")
     else:
         logger.info(f"批量添加完成: 成功添加 {added_count} 个任务")
-
     return added_count
 
 
@@ -1651,67 +1649,73 @@ async def save_msg_to_file(
     return DownloadStatus.SuccessDownload, file_name
 
 
-async def download_task(
-        client: pyrogram.Client, message: pyrogram.types.Message, node: TaskNode
-):
+async def download_task(client, message, node):
     """下载和转发媒体"""
-    original_download_status, file_name = await download_media(
-        client, message, app.media_types, app.file_formats, node
-    )
+    try:
+        original_download_status, file_name = await download_media(
+            client, message, app.media_types, app.file_formats, node
+        )
 
-    # 如果下载成功，从失败列表中移除
-    if original_download_status == DownloadStatus.SuccessDownload:
-        await remove_failed_task(node.chat_id, message.id)
+        if original_download_status == DownloadStatus.SuccessDownload:
+            await remove_failed_task(node.chat_id, message.id)
 
-    if file_name and os.path.exists(file_name):
-        try:
-            file_size = os.path.getsize(file_name)
-            disk_monitor.stats_since_last_notification["download_size"] += file_size
-        except:
-            pass
+        if file_name and os.path.exists(file_name):
+            try:
+                file_size = os.path.getsize(file_name)
+                disk_monitor.stats_since_last_notification["download_size"] += file_size
+            except:
+                pass
 
-    if app.enable_download_txt and message.text and not message.media:
-        download_status, file_name = await save_msg_to_file(app, node.chat_id, message)
-    else:
-        download_status, file_name = original_download_status, file_name
+        if app.enable_download_txt and message.text and not message.media:
+            download_status, file_name = await save_msg_to_file(app, node.chat_id, message)
+        else:
+            download_status, file_name = original_download_status, file_name
 
-    if not node.bot:
-        app.set_download_id(node, message.id, download_status)
+        if not node.bot:
+            app.set_download_id(node, message.id, download_status)
 
-    node.download_status[message.id] = download_status
-    file_size = os.path.getsize(file_name) if file_name else 0
+        node.download_status[message.id] = download_status
+        file_size = os.path.getsize(file_name) if file_name else 0
 
-    await upload_telegram_chat(
-        client,
-        node.upload_user if node.upload_user else client,
-        app,
-        node,
-        message,
-        download_status,
-        file_name,
-    )
-
-    if (
-            not node.upload_telegram_chat_id
-            and download_status is DownloadStatus.SuccessDownload
-    ):
-        ui_file_name = file_name
-        if app.hide_file_name:
-            ui_file_name = f"****{os.path.splitext(file_name)[-1]}"
-        if await app.upload_file(
+        await upload_telegram_chat(
+            client,
+            node.upload_user if node.upload_user else client,
+            app,
+            node,
+            message,
+            download_status,
+            file_name,
+        )
+        logger.debug(
+            f"检查上传条件: node.upload_telegram_chat_id={node.upload_telegram_chat_id}, download_status={download_status}")
+        if not node.upload_telegram_chat_id and download_status is DownloadStatus.SuccessDownload:
+            logger.info(f"开始上传文件: {file_name}")
+            ui_file_name = file_name
+            if app.hide_file_name:
+                ui_file_name = f"****{os.path.splitext(file_name)[-1]}"
+            if await app.upload_file(
                 file_name, update_cloud_upload_stat, (node, message.id, ui_file_name)
-        ):
-            node.upload_success_count += 1
+            ):
+                node.upload_success_count += 1
+        else:
+            logger.debug(f"跳过上传，条件不满足, chat_id:{node.upload_telegram_chat_id}, download_status={download_status}")
 
-    await report_bot_download_status(
-        node.bot,
-        node,
-        download_status,
-        file_size,
-    )
+        await report_bot_download_status(
+            node.bot,
+            node,
+            download_status,
+            file_size,
+        )
 
-    queue_manager.task_processed += 1
+        queue_manager.task_processed += 1
 
+    finally:
+        # 从 download_result 中移除该任务，避免前端显示残留
+        try:
+            from module.download_stat import remove_download_record
+            await remove_download_record(node.chat_id, message.id)
+        except Exception as e:
+            logger.error(f"清除下载记录失败: {e}")
 
 @record_download_status
 async def download_media(
@@ -1890,6 +1894,8 @@ def _check_config() -> bool:
         # 根据配置设置日志级别
         log_level = app.log_level.upper() if hasattr(app, 'log_level') else "INFO"
 
+        logger.debug(f"设置日志级别为: {log_level}")
+
         # 添加控制台处理器
         logger.add(
             sys.stderr,
@@ -1911,13 +1917,18 @@ def _check_config() -> bool:
             diagnose=False
         )
 
-        # 设置DEBUG环境变量
+        # 设置Python标准logging的级别
         if log_level == "DEBUG":
             os.environ["DEBUG"] = "1"
             logging.getLogger().setLevel(logging.DEBUG)
         else:
-            os.environ.pop("DEBUG", None)
-            logging.getLogger().setLevel(logging.INFO)
+            if "DEBUG" in os.environ:
+                os.environ.pop("DEBUG")
+            logging.getLogger().setLevel(getattr(logging, log_level, logging.INFO))
+
+        # 立即验证日志级别
+        logger.debug(f"DEBUG日志测试 - 如果看到这一行，说明日志级别是DEBUG")
+        logger.info(f"INFO日志测试 - 程序启动，日志级别设置为: {log_level}")
 
         return True
     except Exception as e:
@@ -2029,215 +2040,115 @@ async def download_worker(client: pyrogram.client.Client, worker_id: int):
 
 async def download_chat_task(
         client: pyrogram.Client,
+        chat_id: Union[int, str],
         chat_download_config: ChatDownloadConfig,
         node: TaskNode,
 ):
-    """下载所有任务（带流控），包含失败任务重试"""
-    messages_iter = get_chat_history_v2(
-        client,
-        node.chat_id,
-        limit=node.limit,
-        max_id=node.end_offset_id,
-        offset_id=chat_download_config.last_read_message_id,
-        reverse=True,
-    )
+    """仅负责添加新消息（失败任务由 retry_producer 负责）"""
+    try:
+        logger.info(f"开始处理聊天 {chat_id}，last_read_message_id={chat_download_config.last_read_message_id}")
 
-    chat_download_config.node = node
-
-    # 先重试之前的失败任务（每次启动时都重试）
-    failed_tasks = await load_failed_tasks(node.chat_id)
-    if failed_tasks:
-        logger.info(f"启动时发现 {len(failed_tasks)} 个失败任务等待重试")
-
-        # 统计重试次数分布
-        retry_counts = {}
-        for task in failed_tasks:
-            count = task.get('retry_count', 0)
-            retry_counts[count] = retry_counts.get(count, 0) + 1
-
-        logger.info("失败任务重试次数统计：")
-        for count, num in sorted(retry_counts.items()):
-            logger.info(f"  重试次数 {count}: {num} 个任务")
-
-    # 原有的ids_to_retry逻辑
-    if chat_download_config.ids_to_retry:
-        logger.info(f"{_t('Downloading files failed during last run')}...")
-        skipped_messages: list = await client.get_messages(
-            chat_id=node.chat_id, message_ids=chat_download_config.ids_to_retry
+        # 获取新消息
+        messages_iter = get_chat_history_v2(
+            client,
+            chat_id,
+            limit=node.limit,
+            max_id=node.end_offset_id,
+            offset_id=chat_download_config.last_read_message_id,
+            reverse=True,
         )
 
-        logger.info(f"上次运行失败的 {len(chat_download_config.ids_to_retry)} 个任务")
+        chat_download_config.node = node
 
-        if skipped_messages:
-            added = await add_download_task_batch(skipped_messages, node)
-            logger.info(f"已添加 {added} 个上次失败任务到队列")
+        batch_messages = []
+        batch_size = queue_manager.download_queue_size
 
-    # 主消息迭代器处理（带流控）
-    batch_messages = []
-    batch_size = queue_manager.download_queue_size  # 使用队列大小作为批量大小
+        async for message in messages_iter:
+            logger.debug(f"处理消息 {message.id}")
 
-    async for message in messages_iter:
-        meta_data = MetaData()
+            # 检查是否应该跳过
+            if app.need_skip_message(chat_download_config, message.id):
+                continue
 
-        caption = message.caption
-        if caption:
-            caption = validate_title(caption)
-            app.set_caption_name(node.chat_id, message.media_group_id, caption)
-            app.set_caption_entities(
-                node.chat_id, message.media_group_id, message.caption_entities
-            )
-        else:
-            caption = app.get_caption_name(node.chat_id, message.media_group_id)
-        set_meta_data(meta_data, message, caption)
-
-        if app.need_skip_message(chat_download_config, message.id):
-            continue
-
-        if app.exec_filter(chat_download_config, meta_data):
-            batch_messages.append(message)
-
-            # 当收集到足够的消息时，批量添加
-            if len(batch_messages) >= batch_size:
-                added = await add_download_task_batch(batch_messages, node, min(batch_size, len(batch_messages)))
-                batch_messages = []
-
-                if node.total_task % 100 == 0:
-                    logger.info(f"已添加 {node.total_task} 个下载任务到队列...")
-        else:
-            node.download_status[message.id] = DownloadStatus.SkipDownload
-            if message.media_group_id:
-                await upload_telegram_chat(
-                    client,
-                    node.upload_user,
-                    app,
-                    node,
-                    message,
-                    DownloadStatus.SkipDownload,
+            # 检查是否匹配过滤器
+            meta_data = MetaData()
+            caption = message.caption
+            if caption:
+                caption = validate_title(caption)
+                app.set_caption_name(chat_id, message.media_group_id, caption)
+                app.set_caption_entities(
+                    chat_id, message.media_group_id, message.caption_entities
                 )
+            else:
+                caption = app.get_caption_name(chat_id, message.media_group_id)
+            set_meta_data(meta_data, message, caption)
 
-    # 添加剩余的消息
-    if batch_messages:
-        added = await add_download_task_batch(batch_messages, node, len(batch_messages))
+            if app.exec_filter(chat_download_config, meta_data):
+                batch_messages.append(message)
 
-    chat_download_config.need_check = True
-    chat_download_config.total_task = node.total_task
-    node.is_running = True
+                if len(batch_messages) >= batch_size:
+                    logger.info(f"批量添加 {len(batch_messages)} 个消息...")
+                    added = await add_download_task_batch(batch_messages, node)
+                    batch_messages = []
 
-    logger.info(f"新任务添加完成，共 {node.total_task} 个任务等待下载")
+                    if node.total_task % 100 == 0:
+                        logger.info(f"已添加 {node.total_task} 个新任务到队列...")
 
+                    if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
+                        logger.info(f"生产者收到退出信号，停止添加新任务")
+                        break
+            else:
+                node.download_status[message.id] = DownloadStatus.SkipDownload
+                if message.media_group_id:
+                    await upload_telegram_chat(
+                        client,
+                        node.upload_user,
+                        app,
+                        node,
+                        message,
+                        DownloadStatus.SkipDownload,
+                    )
+
+        # 添加剩余的消息
+        if batch_messages and not getattr(app, 'force_exit', False):
+            logger.info(f"添加剩余 {len(batch_messages)} 个消息...")
+            added = await add_download_task_batch(batch_messages, node)
+
+        chat_download_config.need_check = True
+        chat_download_config.total_task = node.total_task
+        node.is_running = True
+
+        logger.info(f"聊天 {chat_id} 新消息处理完成，共添加 {node.total_task} 个新任务")
+    except Exception as e:
+        logger.exception(f"聊天 {chat_id} 下载任务处理异常: {e}")
+        chat_download_config.need_check = True
 
 async def download_all_chat(client: pyrogram.Client):
-    """下载所有聊天"""
-    for key, value in app.chat_download_config.items():
-        value.node = TaskNode(chat_id=key)
-        try:
-            await download_chat_task(client, value, value.node)
-        except Exception as e:
-            logger.warning(f"Download {key} error: {e}")
-        finally:
-            value.need_check = True
+    """下载所有聊天 - 同时启动新消息生产者和重试生产者"""
+    # 第一步：为每个聊天创建 TaskNode（如果尚未创建）
+    for chat_id, value in app.chat_download_config.items():
+        if value.node is None:
+            value.node = TaskNode(chat_id=chat_id)
 
+    # 第二步：启动重试生产者（常驻）
+    retry_tasks = []
+    for chat_id, value in app.chat_download_config.items():
+        if value.node:
+            retry_task = app.loop.create_task(retry_producer(chat_id, value.node, client))
+            retry_tasks.append(retry_task)
 
-async def run_until_all_task_finish():
-    """正常运行直到所有任务完成，并在完成后继续重试失败任务"""
-    logger.info("开始主运行循环...")
+    # 第三步：启动新消息生产者（每个聊天一个，完成后会退出）
+    new_msg_tasks = []
+    for chat_id, value in app.chat_download_config.items():
+        # 传入显式的 chat_id 参数
+        task = app.loop.create_task(download_chat_task(client, chat_id, value, value.node))
+        new_msg_tasks.append(task)
 
-    # 阶段1：处理所有新任务
-    while True:
-        # 检查是否要退出
-        if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
-            logger.info("收到退出信号，准备退出...")
-            break
+    # 等待新消息生产者全部完成
+    await asyncio.gather(*new_msg_tasks, return_exceptions=True)
 
-        # 检查所有新任务是否完成
-        all_new_tasks_done = True
-        for _, value in app.chat_download_config.items():
-            if not value.need_check or value.total_task != value.finish_task:
-                all_new_tasks_done = False
-                break
-
-        # 如果新任务全部完成，进入阶段2：重试失败任务
-        if all_new_tasks_done:
-            logger.info("所有新任务已完成，开始重试失败任务...")
-            break
-
-        # 检查是否需要重启或停止
-        if (not app.bot_token and all_new_tasks_done) or getattr(app, 'restart_program', False):
-            break
-
-        await asyncio.sleep(1)
-
-    # 阶段2：重试失败任务（无限重试直到成功）
-    if not getattr(app, 'force_exit', False) and getattr(app, 'is_running', True):
-        logger.info("进入失败任务重试阶段...")
-
-        # 无限循环重试失败任务
-        while getattr(app, 'is_running', True) and not getattr(app, 'force_exit', False):
-            try:
-                # 检查是否有任何活动任务
-                has_active_tasks = False
-                for _, value in app.chat_download_config.items():
-                    if value.node and value.node.download_status:
-                        downloading_tasks = sum(1 for status in value.node.download_status.values()
-                                                if status == DownloadStatus.Downloading)
-                        if downloading_tasks > 0:
-                            has_active_tasks = True
-                            break
-
-                # 如果没有活动任务，尝试重试失败任务
-                if not has_active_tasks and download_queue.empty():
-                    # 为每个聊天重试失败任务
-                    total_retried = 0
-                    total_failed_tasks = 0
-
-                    for chat_id, value in app.chat_download_config.items():
-                        if value.node:
-                            # 加载失败任务数量
-                            failed_tasks = await load_failed_tasks(chat_id)
-                            total_failed_tasks += len(failed_tasks)
-
-                            if failed_tasks:
-                                logger.info(f"聊天 {chat_id} 有 {len(failed_tasks)} 个失败任务，开始重试...")
-
-                                # 每次重试一批（避免一次性添加太多）
-                                retried, added = await retry_failed_tasks(
-                                    value.node.client if value.node.client else client,
-                                    chat_id,
-                                    value.node,
-                                    max_batch=queue_manager.max_download_tasks * 2  # 根据worker数量调整
-                                )
-
-                                total_retried += retried
-
-                                if added > 0:
-                                    logger.info(f"已为聊天 {chat_id} 添加 {added} 个失败任务重试")
-                                    # 等待一段时间让新任务开始处理
-                                    await asyncio.sleep(5)
-
-                    # 如果没有任何失败任务需要重试，等待一段时间再检查
-                    if total_failed_tasks == 0:
-                        logger.info("当前没有失败任务需要重试，等待30秒后再次检查...")
-                        await asyncio.sleep(30)
-                    elif total_retried == 0:
-                        logger.info("尝试重试失败任务但未能获取消息，等待30秒后重试...")
-                        await asyncio.sleep(30)
-                    else:
-                        logger.info(f"本轮重试了 {total_retried} 个失败任务，等待处理完成...")
-                        await asyncio.sleep(10)
-                else:
-                    # 还有活动任务，等待
-                    await asyncio.sleep(5)
-
-                # 检查是否需要重启或停止
-                if getattr(app, 'restart_program', False) or getattr(app, 'force_exit', False):
-                    break
-
-            except Exception as e:
-                logger.error(f"重试失败任务循环中出错: {e}")
-                await asyncio.sleep(30)
-
-    logger.info("主运行循环结束")
-
+    # 新消息生产者完成后，不取消重试生产者，让它们继续运行
+    logger.info("所有新消息生产者已完成，重试生产者将继续运行")
 
 async def retry_failed_tasks(
         client: pyrogram.Client,
@@ -2273,7 +2184,7 @@ async def retry_failed_tasks(
             return len(failed_tasks[:max_batch]), 0
 
         # 添加到下载队列
-        added = await add_download_task_batch(valid_messages, node, len(valid_messages))
+        added = await add_download_task_batch(valid_messages, node)
 
         if added > 0:
             logger.info(f"已为聊天 {chat_id} 重试 {added}/{len(valid_messages)} 个失败任务")
@@ -2597,25 +2508,21 @@ async def send_event_notification(event_type: str, title: str, body: str, custom
 
     return await send_bark_notification(title, body, group=group, level=level)
 
+
 def main():
     """主函数"""
     setup_exit_signal_handlers()
 
-    tasks = []
+    # 定义任务列表
     notify_tasks = []
     download_tasks = []
     monitor_tasks = []
+    chat_tasks = []
 
-    client = HookClient(
-        "media_downloader",
-        api_id=app.api_id,
-        api_hash=app.api_hash,
-        proxy=app.proxy,
-        workdir=app.session_file_path,
-        start_timeout=app.start_timeout,
-    )
+    client = None
 
     try:
+        # 初始化应用
         app.pre_run()
         init_web(app)
 
@@ -2631,10 +2538,20 @@ def main():
         else:
             logger.success("配置检查通过!")
 
+        # 初始化客户端
+        client = HookClient(
+            "media_downloader",
+            api_id=app.api_id,
+            api_hash=app.api_hash,
+            proxy=app.proxy,
+            workdir=app.session_file_path,
+            start_timeout=app.start_timeout,
+        )
+
         # 更新队列管理器配置
         queue_manager.update_limits()
 
-        # 重新初始化队列大小（确保在更新限制后）
+        # 重新初始化队列大小
         global download_queue, notify_queue
         download_queue = asyncio.Queue(maxsize=queue_manager.download_queue_size)
         notify_queue = asyncio.Queue(maxsize=100)
@@ -2643,6 +2560,30 @@ def main():
 
         # 加载通知管理器配置
         notification_manager.load_config()
+
+        # 发送启动通知（放在这里，确保通知系统已初始化）
+        async def send_startup_notification():
+            if notification_manager.should_notify("startup"):
+                startup_title = "程序启动"
+                startup_message = (
+                    f"🚀 Telegram媒体下载器已启动\n"
+                    f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"版本: 1.0.0\n"
+                    f"下载任务数: {len(app.chat_download_config)}\n"
+                    f"通知系统: {'已启用' if notification_manager.bark_enabled or notification_manager.synology_chat_enabled else '未启用'}"
+                )
+
+                # 测试通知是否正常
+                success = await notification_manager.send_event_notification(
+                    "startup", startup_title, startup_message
+                )
+                if success:
+                    logger.info("✅ 启动通知发送成功")
+                else:
+                    logger.warning("启动通知发送失败")
+
+        # 运行启动通知
+        app.loop.run_until_complete(send_startup_notification())
 
         # 设置全局异常处理器
         def global_exception_handler(loop, context):
@@ -2658,6 +2599,7 @@ def main():
         app.loop.set_exception_handler(global_exception_handler)
         set_max_concurrent_transmissions(client, app.max_concurrent_transmissions)
 
+        # 启动服务器
         app.loop.run_until_complete(start_server(client))
         logger.success(_t("Successfully started (Press Ctrl+C to stop)"))
 
@@ -2667,11 +2609,11 @@ def main():
         if not hasattr(app, 'is_running'):
             app.is_running = True
 
-        # 启动所有worker
+        # 第一步：启动所有worker
         notify_tasks = app.loop.run_until_complete(start_notify_workers())
         download_tasks = app.loop.run_until_complete(start_download_workers(client))
 
-        # 启动监控任务
+        # 第二步：启动监控任务
         if notification_manager.bark_enabled or notification_manager.synology_chat_enabled:
             # 启动磁盘空间监控
             disk_monitor_task_obj = app.loop.create_task(disk_space_monitor_task())
@@ -2686,77 +2628,31 @@ def main():
             monitor_tasks.append(queue_monitor_obj)
 
             logger.info("通知系统已启用，监控任务已启动")
-
-            # 测试通知功能
-            async def test_notifications():
-                """测试所有通知功能"""
-                logger.info("开始测试通知功能...")
-
-                # 测试基本通知
-                test_results = await notification_manager.send_test_notification()
-
-                # 如果有任何一种通知方式成功，就测试磁盘空间检查
-                if test_results.get('bark') or test_results.get('synology_chat'):
-                    try:
-                        # 获取磁盘空间信息
-                        threshold_gb = 10.0
-                        has_space, available_gb, total_gb = await check_disk_space(threshold_gb)
-
-                        # 发送磁盘空间测试通知
-                        await notification_manager.send_disk_space_notification(
-                            has_space, available_gb, total_gb, threshold_gb
-                        )
-                        logger.info("磁盘空间检查测试完成")
-                    except Exception as e:
-                        logger.error(f"磁盘空间检查测试失败: {e}")
-
-                logger.info("通知功能测试完成")
-
-            # 运行测试
-            app.loop.create_task(test_notifications())
         else:
             logger.info("所有通知方式均未启用，跳过监控任务")
 
-        # 发送启动通知
-        async def send_startup_notification():
-            """发送启动通知"""
-            try:
-                # 获取失败任务数
-                total_failed_tasks = 0
-                for chat_id, _ in app.chat_download_config.items():
-                    failed_tasks = await load_failed_tasks(chat_id)
-                    total_failed_tasks += len(failed_tasks)
-            except:
-                total_failed_tasks = 0
+        # 第三步：启动聊天下载任务（异步）
+        logger.info("启动聊天下载任务...")
+        chat_task = app.loop.create_task(download_all_chat(client))
+        chat_tasks.append(chat_task)
 
-            startup_title = "程序启动"
-            startup_message = (
-                f"✅ Telegram媒体下载器已启动\n"
-                f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"下载worker: {queue_manager.max_download_tasks}\n"
-                f"通知worker: {queue_manager.max_notify_tasks}\n"
-                f"下载队列大小: {queue_manager.download_queue_size}\n"
-                f"配置聊天数: {len(app.chat_download_config)}\n"
-                f"待重试失败任务: {total_failed_tasks}"
-            )
+        # 给生产者一些时间开始工作
+        app.loop.run_until_complete(asyncio.sleep(3))
 
-            await notification_manager.send_event_notification("startup", startup_title, startup_message)
-
-        app.loop.create_task(send_startup_notification())
-
-        app.loop.create_task(download_all_chat(client))
-
+        # 第四步：启动机器人（如果有）
         if app.bot_token:
-            app.loop.run_until_complete(
+            logger.info("启动下载机器人...")
+            bot_task = app.loop.create_task(
                 start_download_bot(app, client, add_download_task, download_chat_task)
             )
+            chat_tasks.append(bot_task)
 
         logger.info("=" * 60)
         logger.info("所有组件已启动，开始处理任务...")
         logger.info("失败任务将无限重试直到成功")
         logger.info("=" * 60)
 
-        # 主运行循环
+        # 第五步：进入主运行循环
         app.loop.run_until_complete(run_until_all_task_finish())
 
     except KeyboardInterrupt:
@@ -2766,7 +2662,10 @@ def main():
     except Exception as e:
         logger.exception("{}", e)
     finally:
-        # 执行优雅关闭
+        # 设置退出标志，确保所有任务知道要退出
+        app.is_running = False
+        app.force_exit = True
+
         logger.info("=" * 60)
         logger.info("程序正在停止...")
 
@@ -2776,42 +2675,20 @@ def main():
         except Exception as e:
             logger.error(f"优雅关闭过程中出错: {e}")
 
-        # 保存配置前先打印调试信息
-        logger.info("=" * 60)
-        logger.info("保存配置前检查配置状态:")
-
-        # 检查关键配置是否存在
-        try:
-            # 检查下载路径
-            if hasattr(app, 'save_path'):
-                logger.info(f"保存路径: {app.save_path}")
-            else:
-                logger.warning("保存路径属性不存在")
-
-            # 检查聊天配置数量
-            if hasattr(app, 'chat_download_config'):
-                logger.info(f"聊天配置数量: {len(app.chat_download_config)}")
-                # 打印每个聊天的关键信息
-                for chat_id, config in app.chat_download_config.items():
-                    logger.info(f"  聊天 {chat_id}: last_read={config.last_read_message_id}")
-            else:
-                logger.warning("聊天配置属性不存在")
-
-            # 检查配置文件名
-            if hasattr(app, 'config_file'):
-                logger.info(f"配置文件: {app.config_file}")
-            else:
-                logger.warning("配置文件名属性不存在")
-        except Exception as e:
-            logger.error(f"检查配置状态时出错: {e}")
-
-        logger.info("=" * 60)
-
-        # 取消所有任务（在优雅关闭后执行）
+        # 取消所有任务
         logger.info("取消所有任务...")
-        all_tasks = monitor_tasks + download_tasks + notify_tasks
+        all_tasks = []
+        if 'chat_tasks' in locals():
+            all_tasks.extend(chat_tasks)
+        if 'monitor_tasks' in locals():
+            all_tasks.extend(monitor_tasks)
+        if 'download_tasks' in locals():
+            all_tasks.extend(download_tasks)
+        if 'notify_tasks' in locals():
+            all_tasks.extend(notify_tasks)
+
         for task in all_tasks:
-            if not task.done():
+            if hasattr(task, 'done') and not task.done():
                 try:
                     task.cancel()
                 except:
@@ -2819,81 +2696,61 @@ def main():
 
         # 等待一小段时间让任务响应取消
         try:
-            app.loop.run_until_complete(asyncio.sleep(1))
+            app.loop.run_until_complete(asyncio.sleep(2))
         except:
             pass
 
-        # 备份原配置文件
-        config_backup = None
-        try:
-            if hasattr(app, 'config_file') and os.path.exists(app.config_file):
-                with open(app.config_file, 'r', encoding='utf-8') as f:
-                    config_backup = f.read()
-                logger.info(f"已备份原配置文件（大小: {len(config_backup)} 字节）")
-        except Exception as e:
-            logger.error(f"备份配置文件失败: {e}")
+        # 打印当前聊天配置状态
+        logger.info("当前聊天配置状态:")
+        for chat_id, chat_config in app.chat_download_config.items():
+            logger.info(
+                f"  - 聊天 {chat_id}: last_read_message_id={getattr(chat_config, 'last_read_message_id', '未设置')}")
 
-        # 更新配置（添加更多保护）
         logger.info(f"{_t('update config')}......")
         try:
-            # 再次检查配置状态
-            if not hasattr(app, 'chat_download_config') or len(app.chat_download_config) == 0:
-                logger.error("聊天配置为空，跳过保存配置以避免数据丢失")
-                if config_backup:
-                    logger.warning("尝试恢复备份的配置文件...")
-                    try:
-                        with open(app.config_file, 'w', encoding='utf-8') as f:
-                            f.write(config_backup)
-                        logger.info("已恢复备份的配置文件")
-                    except Exception as e:
-                        logger.error(f"恢复备份失败: {e}")
-            else:
-                app.update_config()
+            # 尝试更新配置
+            success = app.update_config()
+            if success:
+                logger.success(f"{_t('Updated last read message_id to config file')}")
 
-                # 验证保存后的配置
-                if os.path.exists(app.config_file):
-                    with open(app.config_file, 'r', encoding='utf-8') as f:
-                        saved_config = f.read()
-                    if len(saved_config) > 100:  # 配置文件应该有一定大小
-                        logger.success(f"{_t('Updated last read message_id to config file')}")
-                        logger.info(f"配置文件大小: {len(saved_config)} 字节")
-                    else:
-                        logger.error(f"配置文件过小（{len(saved_config)} 字节），可能保存失败")
-                        # 尝试恢复备份
-                        if config_backup:
-                            with open(app.config_file, 'w', encoding='utf-8') as f:
-                                f.write(config_backup)
-                            logger.info("已恢复备份的配置文件")
+                # 显示更新后的配置（直接使用 app.config）
+                if hasattr(app, 'config') and 'chat' in app.config:
+                    logger.info("更新后的聊天配置:")
+                    for chat_item in app.config['chat']:
+                        chat_id = chat_item.get('chat_id')
+                        last_id = chat_item.get('last_read_message_id')
+                        logger.info(f"  - chat_id: {chat_id}, last_read_message_id: {last_id}")
                 else:
-                    logger.error("配置文件不存在，保存失败")
-
+                    logger.warning("无法获取更新后的配置信息")
+            else:
+                logger.warning(f"配置更新可能失败，请检查日志")
         except Exception as e:
             logger.error(f"保存配置时出错: {e}")
-            # 尝试恢复备份
-            if config_backup:
-                try:
-                    with open(app.config_file, 'w', encoding='utf-8') as f:
-                        f.write(config_backup)
-                    logger.info("出错后已恢复备份的配置文件")
-                except Exception as e2:
-                    logger.error(f"恢复备份失败: {e2}")
+            import traceback
+            logger.error(f"堆栈信息: {traceback.format_exc()}")
 
-        # 停止机器人
+        # 检查配置文件大小
+        try:
+            if os.path.exists(CONFIG_NAME):
+                file_size = os.path.getsize(CONFIG_NAME)
+                logger.info(f"配置文件大小: {file_size} 字节")
+        except:
+            pass
+
         if app.bot_token:
             try:
                 app.loop.run_until_complete(stop_download_bot())
             except:
                 pass
 
-        # 停止客户端
         try:
-            app.loop.run_until_complete(stop_server(client))
+            if client:
+                app.loop.run_until_complete(stop_server(client))
         except:
             pass
 
         logger.info(_t("Stopped!"))
 
-        # 打印最终统计信息
         logger.info("=" * 60)
         logger.info("下载统计:")
         logger.success(
