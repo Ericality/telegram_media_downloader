@@ -1084,11 +1084,8 @@ def setup_exit_signal_handlers():
 
 
 async def graceful_shutdown():
-    """优雅关闭所有组件，确保发送关闭通知"""
+    """优雅关闭所有组件 - 改进版本"""
     logger.info("开始优雅关闭...")
-
-    # 记录开始关闭时间
-    shutdown_start_time = time.time()
 
     # 1. 停止添加新任务
     if hasattr(app, 'is_running'):
@@ -1096,25 +1093,33 @@ async def graceful_shutdown():
     if not hasattr(app, 'force_exit'):
         app.force_exit = True
 
-    # 2. 立即停止所有下载worker（包括被暂停的）
-    logger.info("停止所有下载worker...")
-    # 清除暂停状态，让worker能正常退出
-    disk_monitor.paused_workers.clear()
+    # 2. 等待当前活动任务完成（最多等待30秒）
+    logger.info("等待活动任务完成...")
+    wait_start = time.time()
+    max_wait_time = 30
 
-    # 3. 立即处理未完成的任务（不等待）
-    logger.info("处理未完成任务...")
+    while time.time() - wait_start < max_wait_time:
+        # 检查是否还有活动任务
+        has_active_tasks = False
+        for _, value in app.chat_download_config.items():
+            if value.node and value.node.download_status:
+                downloading_tasks = sum(1 for status in value.node.download_status.values()
+                                        if status == DownloadStatus.Downloading)
+                if downloading_tasks > 0:
+                    has_active_tasks = True
+                    break
+
+        if not has_active_tasks and download_queue.empty():
+            logger.info("所有活动任务已完成")
+            break
+
+        await asyncio.sleep(1)
+
+    # 3. 记录剩余的未完成任务到失败列表（而不是配置）
+    logger.info("记录未完成任务...")
     pending_messages = []
 
-    # 立即停止所有活动任务
-    for _, value in app.chat_download_config.items():
-        if hasattr(value, 'node') and value.node:
-            for message_id, status in list(value.node.download_status.items()):
-                if status == DownloadStatus.Downloading:
-                    # 将活动任务标记为失败
-                    value.node.download_status[message_id] = DownloadStatus.FailedDownload
-                    pending_messages.append((message_id, value.node.chat_id))
-
-    # 获取队列中所有待处理的任务
+    # 清空下载队列，记录到失败任务文件
     try:
         while not download_queue.empty():
             try:
@@ -1126,110 +1131,25 @@ async def graceful_shutdown():
     except Exception as e:
         logger.error(f"清空下载队列时出错: {e}")
 
-    # 记录所有未完成的任务到失败列表
+    # 将未完成的任务记录到失败任务文件
     if pending_messages:
-        logger.warning(f"发现 {len(pending_messages)} 个未完成任务")
+        logger.warning(f"有 {len(pending_messages)} 个队列任务未完成，已记录到失败列表")
         for message_id, chat_id in pending_messages:
-            await record_failed_task(chat_id, message_id, "程序退出，任务未完成")
-        logger.warning(f"已记录 {len(pending_messages)} 个未完成任务到失败列表")
+            await record_failed_task(chat_id, message_id, "程序退出，队列任务未处理")
 
-    # 4. 等待通知worker处理队列（最多等待5秒）
+    # 4. 等待通知发送完成（缩短等待时间）
     logger.info("等待通知发送完成...")
-    notification_wait_start = time.time()
-    notification_timeout = 5
+    notification_timeout = 3
+    notification_start = time.time()
 
-    while time.time() - notification_wait_start < notification_timeout:
+    while time.time() - notification_start < notification_timeout:
         if notify_queue.empty():
-            logger.info("通知队列已空")
             break
-
-        queue_size = notify_queue.qsize()
-        if time.time() - notification_wait_start > 1:  # 每秒报告一次
-            logger.info(f"等待通知发送完成，队列剩余: {queue_size}")
-
         await asyncio.sleep(0.5)
 
-    # 5. 强制清空通知队列（如果还有剩余）
-    if not notify_queue.empty():
-        logger.warning(f"强制清空通知队列，剩余 {notify_queue.qsize()} 个通知")
-        cleared_notify = 0
-        while not notify_queue.empty():
-            try:
-                notify_queue.get_nowait()
-                notify_queue.task_done()
-                cleared_notify += 1
-            except (asyncio.QueueEmpty, ValueError):
-                break
-        logger.info(f"已清除 {cleared_notify} 个通知")
+    # 5. 不发送关闭通知，避免影响配置更新
 
-    # 6. 发送关闭通知（使用同步发送确保发送成功）
-    try:
-        # 收集统计信息
-        try:
-            stats = await collect_stats_async()
-        except:
-            stats = {}
-
-        # 构建关闭消息
-        shutdown_msg = (
-            f"🛑 Telegram媒体下载器已停止\n"
-            f"停止时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"运行时间: {stats.get('uptime', 'N/A') if stats else 'N/A'}\n"
-            f"完成任务: {stats.get('tasks_completed', 0) if stats else 0}\n"
-            f"未完成任务: {len(pending_messages)}\n"
-            f"下载队列剩余: {download_queue.qsize()}\n"
-            f"通知队列剩余: {notify_queue.qsize()}\n"
-            f"关闭耗时: {time.time() - shutdown_start_time:.1f}秒"
-        )
-
-        # 直接发送关闭通知（不使用队列，确保发送）
-        logger.info("直接发送关闭通知...")
-
-        # 发送 Bark 通知
-        if notification_manager.bark_enabled:
-            bark_config = notification_manager.bark_config
-            bark_url = bark_config.get('url')
-            bark_group = bark_config.get('default_group')
-            bark_level = bark_config.get('default_level', 'active')
-
-            try:
-                bark_success = await send_bark_notification_sync(
-                    "程序停止",
-                    shutdown_msg,
-                    url=bark_url,
-                    group=bark_group,
-                    level=bark_level
-                )
-                if bark_success:
-                    logger.info("Bark关闭通知发送成功")
-                else:
-                    logger.warning("Bark关闭通知发送失败")
-            except Exception as e:
-                logger.error(f"发送Bark关闭通知时出错: {e}")
-
-        # 发送群晖 Chat 通知
-        if notification_manager.synology_chat_enabled:
-            synology_config = notification_manager.synology_chat_config
-            webhook_url = synology_config.get('webhook_url')
-
-            try:
-                synology_success = await send_synology_chat_notification_sync(
-                    "程序停止",
-                    shutdown_msg,
-                    level="info",  # 使用info级别，确保可见
-                    webhook_url=webhook_url
-                )
-                if synology_success:
-                    logger.info("群晖Chat关闭通知发送成功")
-                else:
-                    logger.warning("群晖Chat关闭通知发送失败")
-            except Exception as e:
-                logger.error(f"发送群晖Chat关闭通知时出错: {e}")
-
-    except Exception as e:
-        logger.error(f"发送停止通知失败: {e}")
-
-    logger.info(f"优雅关闭完成，总耗时: {time.time() - shutdown_start_time:.1f}秒")
+    logger.info("优雅关闭完成")
 
 
 async def run_until_all_task_finish():

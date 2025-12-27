@@ -915,77 +915,120 @@ class Application:
         return True
 
     # pylint: disable = R0912
+    # 在 app.py 中修改 Application 类的 update_config 方法
     def update_config(self, immediate: bool = True):
-        """update config
-
-        Parameters
-        ----------
-        immediate: bool
-            If update config immediate,default True
-        """
-        # TODO: fix this not exist chat
+        """更新配置 - 重构版本"""
+        # 确保 app_data 中有 chat 配置
         if not self.app_data.get("chat") and self.config.get("chat"):
             self.app_data["chat"] = [
                 {"chat_id": i} for i in range(0, len(self.config["chat"]))
             ]
-        idx = 0
-        # pylint: disable = R1733
-        for key, value in self.chat_download_config.items():
-            # pylint: disable = W0201
-            unfinished_ids = set(value.ids_to_retry)
 
-            for it in value.ids_to_retry:
-                if  value.node.download_status.get(
-                    it, DownloadStatus.FailedDownload
-                ) in [DownloadStatus.SuccessDownload, DownloadStatus.SkipDownload]:
-                    unfinished_ids.remove(it)
+        # 创建 chat_id 到索引的映射
+        chat_id_to_idx = {}
+        for idx, chat_item in enumerate(self.config.get("chat", [])):
+            chat_id = chat_item.get("chat_id")
+            if chat_id:
+                chat_id_to_idx[chat_id] = idx
 
-            for _idx, _value in value.node.download_status.items():
-                if DownloadStatus.SuccessDownload != _value and DownloadStatus.SkipDownload != _value:
-                    unfinished_ids.add(_idx)
+        # 遍历聊天配置，更新状态
+        for chat_id, chat_config in self.chat_download_config.items():
+            # 找到对应的索引
+            idx = chat_id_to_idx.get(chat_id, -1)
 
-            self.chat_download_config[key].ids_to_retry = list(unfinished_ids)
+            # 如果不存在于原始配置中，跳过（临时任务不应该保存到配置）
+            if idx == -1:
+                continue
 
-            if idx >= len(self.app_data["chat"]):
+            # 收集失败任务ID
+            unfinished_ids = set()
+
+            # 1. 从已有的失败任务开始
+            for task_id in chat_config.ids_to_retry:
+                unfinished_ids.add(task_id)
+
+            # 2. 检查当前节点状态，只添加确实失败的任务
+            if chat_config.node and chat_config.node.download_status:
+                for task_id, status in chat_config.node.download_status.items():
+                    if status in [DownloadStatus.FailedDownload, DownloadStatus.Downloading]:
+                        # 只有确实失败的任务才添加到重试列表
+                        unfinished_ids.add(task_id)
+                        logger.debug(f"任务 {task_id} 状态为 {status}，添加到重试列表")
+
+            # 3. 检查失败任务文件中的任务
+            try:
+                failed_tasks_file = os.path.join(self.session_file_path, "failed_tasks.json")
+                if os.path.exists(failed_tasks_file):
+                    with open(failed_tasks_file, 'r', encoding='utf-8') as f:
+                        all_failed_tasks = json.load(f)
+
+                    chat_key = str(chat_id)
+                    if chat_key in all_failed_tasks:
+                        for task in all_failed_tasks[chat_key]:
+                            unfinished_ids.add(task['message_id'])
+            except Exception as e:
+                logger.error(f"读取失败任务文件失败: {e}")
+
+            # 更新配置中的失败任务列表
+            chat_config.ids_to_retry = list(unfinished_ids)
+
+            # 确保 app_data 有足够的项目
+            while idx >= len(self.app_data["chat"]):
                 self.app_data["chat"].append({})
 
-            if value.finish_task:
-                self.config["chat"][idx]["last_read_message_id"] = (
-                    value.last_read_message_id + 1
-                )
+            # 只更新 last_read_message_id 如果确实有完成任务
+            if chat_config.finish_task > 0 and chat_config.last_read_message_id > 0:
+                # 确保新的 last_read_message_id 比原来的大
+                current_last_id = self.config["chat"][idx].get("last_read_message_id", 0)
+                new_last_id = max(current_last_id, chat_config.last_read_message_id + 1)
+                self.config["chat"][idx]["last_read_message_id"] = new_last_id
+                logger.debug(f"更新聊天 {chat_id} 的 last_read_message_id: {new_last_id}")
 
-            self.app_data["chat"][idx]["chat_id"] = key
-            self.app_data["chat"][idx]["ids_to_retry"] = value.ids_to_retry
-            idx += 1
+            # 更新 app_data
+            self.app_data["chat"][idx]["chat_id"] = chat_id
+            self.app_data["chat"][idx]["ids_to_retry"] = chat_config.ids_to_retry
 
+        # 更新其他配置项
         self.config["save_path"] = self.save_path
         self.config["file_path_prefix"] = self.file_path_prefix
 
-        if self.config.get("ids_to_retry"):
-            self.config.pop("ids_to_retry")
+        # 清理旧版配置项
+        old_keys = ["ids_to_retry", "chat_id", "download_filter", "last_read_message_id"]
+        for key in old_keys:
+            if key in self.config:
+                self.config.pop(key)
 
-        if self.config.get("chat_id"):
-            self.config.pop("chat_id")
-
-        if self.config.get("download_filter"):
-            self.config.pop("download_filter")
-
-        if self.config.get("last_read_message_id"):
-            self.config.pop("last_read_message_id")
-
+        # 更新语言配置
         self.config["language"] = self.language.name
-        # for it in self.downloaded_ids:
-        #    self.already_download_ids_set.add(it)
 
-        # self.app_data["already_download_ids"] = list(self.already_download_ids_set)
-
+        # 立即写入配置
         if immediate:
-            with open(self.config_file, "w", encoding="utf-8") as yaml_file:
-                _yaml.dump(self.config, yaml_file)
+            try:
+                # 备份原始配置以防万一
+                config_backup = f"{self.config_file}.backup.{int(time.time())}"
+                if os.path.exists(self.config_file):
+                    shutil.copy2(self.config_file, config_backup)
+                    logger.info(f"已备份配置到: {config_backup}")
 
-        if immediate:
-            with open(self.app_data_file, "w", encoding='utf-8') as yaml_file:
-                _yaml.dump(self.app_data, yaml_file)
+                # 写入新配置
+                with open(self.config_file, "w", encoding="utf-8") as yaml_file:
+                    _yaml.dump(self.config, yaml_file)
+                logger.info("配置更新成功")
+
+                # 写入应用数据
+                with open(self.app_data_file, "w", encoding='utf-8') as yaml_file:
+                    _yaml.dump(self.app_data, yaml_file)
+                logger.info("应用数据更新成功")
+
+            except Exception as e:
+                logger.error(f"写入配置失败: {e}")
+                # 尝试恢复备份
+                if os.path.exists(config_backup):
+                    try:
+                        shutil.copy2(config_backup, self.config_file)
+                        logger.info("已从备份恢复配置")
+                    except Exception as restore_error:
+                        logger.error(f"恢复配置失败: {restore_error}")
 
     def set_language(self, language: Language):
         """Set Language"""
