@@ -2876,15 +2876,15 @@ def main():
             if success:
                 logger.success(f"{_t('Updated last read message_id to config file')}")
 
-                # 读取并显示更新后的配置
-                if os.path.exists(CONFIG_NAME):
-                    with open(CONFIG_NAME, 'r', encoding='utf-8') as f:
-                        updated_config = yaml.safe_load(f)
-                        if updated_config and 'chat' in updated_config:
-                            logger.info("更新后的聊天配置:")
-                            for chat_item in updated_config['chat']:
-                                logger.info(f"  - chat_id: {chat_item.get('chat_id')}, "
-                                            f"last_read_message_id: {chat_item.get('last_read_message_id')}")
+                # 显示更新后的配置（直接使用 app.config）
+                if hasattr(app, 'config') and 'chat' in app.config:
+                    logger.info("更新后的聊天配置:")
+                    for chat_item in app.config['chat']:
+                        chat_id = chat_item.get('chat_id')
+                        last_id = chat_item.get('last_read_message_id')
+                        logger.info(f"  - chat_id: {chat_id}, last_read_message_id: {last_id}")
+                else:
+                    logger.warning("无法获取更新后的配置信息")
             else:
                 logger.warning(f"配置更新可能失败，请检查日志")
         except Exception as e:
@@ -2900,14 +2900,12 @@ def main():
         except:
             pass
 
-        # 停止机器人
         if app.bot_token:
             try:
                 app.loop.run_until_complete(stop_download_bot())
             except:
                 pass
 
-        # 停止客户端
         try:
             app.loop.run_until_complete(stop_server(client))
         except:
@@ -2915,7 +2913,6 @@ def main():
 
         logger.info(_t("Stopped!"))
 
-        # 打印最终统计信息
         logger.info("=" * 60)
         logger.info("下载统计:")
         logger.success(
