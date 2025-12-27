@@ -2856,6 +2856,37 @@ def main():
         except Exception as e:
             logger.error(f"优雅关闭过程中出错: {e}")
 
+        # 保存配置前先打印调试信息
+        logger.info("=" * 60)
+        logger.info("保存配置前检查配置状态:")
+
+        # 检查关键配置是否存在
+        try:
+            # 检查下载路径
+            if hasattr(app, 'save_path'):
+                logger.info(f"保存路径: {app.save_path}")
+            else:
+                logger.warning("保存路径属性不存在")
+
+            # 检查聊天配置数量
+            if hasattr(app, 'chat_download_config'):
+                logger.info(f"聊天配置数量: {len(app.chat_download_config)}")
+                # 打印每个聊天的关键信息
+                for chat_id, config in app.chat_download_config.items():
+                    logger.info(f"  聊天 {chat_id}: last_read={config.last_read_message_id}")
+            else:
+                logger.warning("聊天配置属性不存在")
+
+            # 检查配置文件名
+            if hasattr(app, 'config_file'):
+                logger.info(f"配置文件: {app.config_file}")
+            else:
+                logger.warning("配置文件名属性不存在")
+        except Exception as e:
+            logger.error(f"检查配置状态时出错: {e}")
+
+        logger.info("=" * 60)
+
         # 取消所有任务（在优雅关闭后执行）
         logger.info("取消所有任务...")
         all_tasks = monitor_tasks + download_tasks + notify_tasks
@@ -2872,19 +2903,69 @@ def main():
         except:
             pass
 
+        # 备份原配置文件
+        config_backup = None
+        try:
+            if hasattr(app, 'config_file') and os.path.exists(app.config_file):
+                with open(app.config_file, 'r', encoding='utf-8') as f:
+                    config_backup = f.read()
+                logger.info(f"已备份原配置文件（大小: {len(config_backup)} 字节）")
+        except Exception as e:
+            logger.error(f"备份配置文件失败: {e}")
+
+        # 更新配置（添加更多保护）
         logger.info(f"{_t('update config')}......")
         try:
-            app.update_config()
-            logger.success(f"{_t('Updated last read message_id to config file')}")
+            # 再次检查配置状态
+            if not hasattr(app, 'chat_download_config') or len(app.chat_download_config) == 0:
+                logger.error("聊天配置为空，跳过保存配置以避免数据丢失")
+                if config_backup:
+                    logger.warning("尝试恢复备份的配置文件...")
+                    try:
+                        with open(app.config_file, 'w', encoding='utf-8') as f:
+                            f.write(config_backup)
+                        logger.info("已恢复备份的配置文件")
+                    except Exception as e:
+                        logger.error(f"恢复备份失败: {e}")
+            else:
+                app.update_config()
+
+                # 验证保存后的配置
+                if os.path.exists(app.config_file):
+                    with open(app.config_file, 'r', encoding='utf-8') as f:
+                        saved_config = f.read()
+                    if len(saved_config) > 100:  # 配置文件应该有一定大小
+                        logger.success(f"{_t('Updated last read message_id to config file')}")
+                        logger.info(f"配置文件大小: {len(saved_config)} 字节")
+                    else:
+                        logger.error(f"配置文件过小（{len(saved_config)} 字节），可能保存失败")
+                        # 尝试恢复备份
+                        if config_backup:
+                            with open(app.config_file, 'w', encoding='utf-8') as f:
+                                f.write(config_backup)
+                            logger.info("已恢复备份的配置文件")
+                else:
+                    logger.error("配置文件不存在，保存失败")
+
         except Exception as e:
             logger.error(f"保存配置时出错: {e}")
+            # 尝试恢复备份
+            if config_backup:
+                try:
+                    with open(app.config_file, 'w', encoding='utf-8') as f:
+                        f.write(config_backup)
+                    logger.info("出错后已恢复备份的配置文件")
+                except Exception as e2:
+                    logger.error(f"恢复备份失败: {e2}")
 
+        # 停止机器人
         if app.bot_token:
             try:
                 app.loop.run_until_complete(stop_download_bot())
             except:
                 pass
 
+        # 停止客户端
         try:
             app.loop.run_until_complete(stop_server(client))
         except:
@@ -2892,6 +2973,7 @@ def main():
 
         logger.info(_t("Stopped!"))
 
+        # 打印最终统计信息
         logger.info("=" * 60)
         logger.info("下载统计:")
         logger.success(
