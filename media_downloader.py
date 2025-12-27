@@ -1481,7 +1481,7 @@ async def add_download_task(
     while True:
         # 首先检查是否要退出
         if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
-            logger.debug(f"消息 {message.id}: 程序正在退出，跳过添加任务")
+            logger.debug(f"程序正在退出，跳过添加任务: message_id={message.id}")
             return False
 
         try:
@@ -1503,12 +1503,14 @@ async def add_download_task(
                         # 立即更新聊天配置的 last_read_message_id
                         chat_config = app.chat_download_config.get(node.chat_id)
                         if chat_config:
-                            # 使用 max 确保只向前更新
-                            chat_config.last_read_message_id = max(
-                                chat_config.last_read_message_id,
-                                message.id
-                            )
-                            logger.debug(f"更新聊天 {node.chat_id} 的 last_read_message_id 到 {message.id}")
+                            # 确保 message.id 是整数
+                            message_id_int = int(message.id)
+                            current_last_id = int(getattr(chat_config, 'last_read_message_id', 0))
+
+                            # 只向前更新
+                            if message_id_int > current_last_id:
+                                chat_config.last_read_message_id = message_id_int
+                                logger.debug(f"更新聊天 {node.chat_id} 的 last_read_message_id 到 {message_id_int}")
 
                         # 添加任务到队列
                         await download_queue.put((message, node))
@@ -1517,8 +1519,7 @@ async def add_download_task(
 
                         logger.debug(
                             f"已添加下载任务: message_id={message.id}, "
-                            f"队列大小={download_queue.qsize()}/{queue_capacity}, "
-                            f"last_read_message_id 更新到 {message.id}"
+                            f"队列大小={download_queue.qsize()}/{queue_capacity}"
                         )
                         return True
 
@@ -1578,18 +1579,19 @@ async def add_download_task_batch(
         logger.debug("程序不在运行状态，跳过批量添加")
         return 0
 
+    if not messages:
+        return 0
+
     added_count = 0
     failed_count = 0
 
-    # 找到这些消息中最大的ID
-    if messages:
-        max_message_id = max(msg.id for msg in messages)
-        chat_config = app.chat_download_config.get(node.chat_id)
-        if chat_config:
-            chat_config.last_read_message_id = max(
-                chat_config.last_read_message_id,
-                max_message_id
-            )
+    # 找到这些消息中最大的ID，立即更新进度
+    max_message_id = max(msg.id for msg in messages if msg)
+    chat_config = app.chat_download_config.get(node.chat_id)
+    if chat_config:
+        current_last_id = int(getattr(chat_config, 'last_read_message_id', 0))
+        if max_message_id > current_last_id:
+            chat_config.last_read_message_id = max_message_id
             logger.debug(f"批量更新聊天 {node.chat_id} 的 last_read_message_id 到 {max_message_id}")
 
     # 使用信号量控制并发
@@ -1619,7 +1621,7 @@ async def add_download_task_batch(
             await record_failed_task(node.chat_id, msg.id, f"批量添加异常: {e}")
 
     # 创建所有任务
-    tasks = [add_single_task(msg) for msg in messages]
+    tasks = [add_single_task(msg) for msg in messages if msg]
 
     # 等待所有任务完成
     try:
@@ -1628,7 +1630,8 @@ async def add_download_task_batch(
         logger.warning("批量添加任务被取消")
         # 记录剩余未处理的任务
         for msg in messages[added_count + failed_count:]:
-            await record_failed_task(node.chat_id, msg.id, "批量添加被取消")
+            if msg:
+                await record_failed_task(node.chat_id, msg.id, "批量添加被取消")
 
     if failed_count > 0:
         logger.warning(f"批量添加完成: 成功 {added_count} 个，失败 {failed_count} 个")
@@ -2808,6 +2811,7 @@ def main():
             app.force_exit = True
     except Exception as e:
         logger.exception("{}", e)
+    # 在 main 函数的 finally 块中，修改配置更新
     finally:
         # 执行优雅关闭
         logger.info("=" * 60)
@@ -2819,38 +2823,7 @@ def main():
         except Exception as e:
             logger.error(f"优雅关闭过程中出错: {e}")
 
-        # 保存配置前先打印调试信息
-        logger.info("=" * 60)
-        logger.info("保存配置前检查配置状态:")
-
-        # 检查关键配置是否存在
-        try:
-            # 检查下载路径
-            if hasattr(app, 'save_path'):
-                logger.info(f"保存路径: {app.save_path}")
-            else:
-                logger.warning("保存路径属性不存在")
-
-            # 检查聊天配置数量
-            if hasattr(app, 'chat_download_config'):
-                logger.info(f"聊天配置数量: {len(app.chat_download_config)}")
-                # 打印每个聊天的关键信息
-                for chat_id, config in app.chat_download_config.items():
-                    logger.info(f"  聊天 {chat_id}: last_read={config.last_read_message_id}")
-            else:
-                logger.warning("聊天配置属性不存在")
-
-            # 检查配置文件名
-            if hasattr(app, 'config_file'):
-                logger.info(f"配置文件: {app.config_file}")
-            else:
-                logger.warning("配置文件名属性不存在")
-        except Exception as e:
-            logger.error(f"检查配置状态时出错: {e}")
-
-        logger.info("=" * 60)
-
-        # 取消所有任务（在优雅关闭后执行）
+        # 取消所有任务
         logger.info("取消所有任务...")
         all_tasks = monitor_tasks + download_tasks + notify_tasks
         for task in all_tasks:
@@ -2866,60 +2839,24 @@ def main():
         except:
             pass
 
-        # 备份原配置文件
-        config_backup = None
-        try:
-            if hasattr(app, 'config_file') and os.path.exists(app.config_file):
-                with open(app.config_file, 'r', encoding='utf-8') as f:
-                    config_backup = f.read()
-                logger.info(f"已备份原配置文件（大小: {len(config_backup)} 字节）")
-        except Exception as e:
-            logger.error(f"备份配置文件失败: {e}")
-
-        # 更新配置（添加更多保护）
         logger.info(f"{_t('update config')}......")
         try:
-            # 再次检查配置状态
-            if not hasattr(app, 'chat_download_config') or len(app.chat_download_config) == 0:
-                logger.error("聊天配置为空，跳过保存配置以避免数据丢失")
-                if config_backup:
-                    logger.warning("尝试恢复备份的配置文件...")
-                    try:
-                        with open(app.config_file, 'w', encoding='utf-8') as f:
-                            f.write(config_backup)
-                        logger.info("已恢复备份的配置文件")
-                    except Exception as e:
-                        logger.error(f"恢复备份失败: {e}")
+            # 尝试更新配置
+            success = app.update_config()
+            if success:
+                logger.success(f"{_t('Updated last read message_id to config file')}")
             else:
-                app.update_config()
-
-                # 验证保存后的配置
-                if os.path.exists(app.config_file):
-                    with open(app.config_file, 'r', encoding='utf-8') as f:
-                        saved_config = f.read()
-                    if len(saved_config) > 100:  # 配置文件应该有一定大小
-                        logger.success(f"{_t('Updated last read message_id to config file')}")
-                        logger.info(f"配置文件大小: {len(saved_config)} 字节")
-                    else:
-                        logger.error(f"配置文件过小（{len(saved_config)} 字节），可能保存失败")
-                        # 尝试恢复备份
-                        if config_backup:
-                            with open(app.config_file, 'w', encoding='utf-8') as f:
-                                f.write(config_backup)
-                            logger.info("已恢复备份的配置文件")
-                else:
-                    logger.error("配置文件不存在，保存失败")
-
+                logger.warning(f"配置更新可能失败，请检查日志")
         except Exception as e:
             logger.error(f"保存配置时出错: {e}")
-            # 尝试恢复备份
-            if config_backup:
-                try:
-                    with open(app.config_file, 'w', encoding='utf-8') as f:
-                        f.write(config_backup)
-                    logger.info("出错后已恢复备份的配置文件")
-                except Exception as e2:
-                    logger.error(f"恢复备份失败: {e2}")
+
+        # 检查配置文件大小
+        try:
+            if os.path.exists(CONFIG_NAME):
+                file_size = os.path.getsize(CONFIG_NAME)
+                logger.info(f"配置文件大小: {file_size} 字节")
+        except:
+            pass
 
         # 停止机器人
         if app.bot_token:

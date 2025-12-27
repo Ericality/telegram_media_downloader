@@ -18,6 +18,9 @@ from module.language import Language, set_language
 from utils.format import replace_date_time, validate_title
 from utils.meta_data import MetaData
 
+import shutil
+import json
+
 _yaml = yaml.YAML()
 # pylint: disable = R0902
 
@@ -915,10 +918,11 @@ class Application:
         return True
 
     # pylint: disable = R0912
-    # 在 app.py 中修改 Application 类的 update_config 方法
     def update_config(self, immediate: bool = True):
-        """更新配置 - 简化版本，主要更新 last_read_message_id"""
+        """更新配置 - 修复版本"""
         try:
+            logger.info(f"开始更新配置...")
+
             # 确保 app_data 中有 chat 配置
             if not self.app_data.get("chat") and self.config.get("chat"):
                 self.app_data["chat"] = [
@@ -932,12 +936,14 @@ class Application:
                 if chat_id:
                     chat_id_to_idx[chat_id] = idx
 
-            # 遍历聊天配置，只更新 last_read_message_id
+            # 遍历聊天配置，更新 last_read_message_id
+            updated_chats = 0
             for chat_id, chat_config in self.chat_download_config.items():
-                idx = chat_id_to_idx.get(chat_id, -1)
+                idx = chat_id_to_idx.get(str(chat_id), -1)
 
-                # 如果不存在于原始配置中，跳过（临时任务不应该保存到配置）
+                # 如果不存在于原始配置中，跳过
                 if idx == -1:
+                    logger.warning(f"聊天 {chat_id} 不在原始配置中，跳过更新")
                     continue
 
                 # 确保 app_data 有足够的项目
@@ -945,50 +951,79 @@ class Application:
                     self.app_data["chat"].append({})
 
                 # 更新 app_data
-                self.app_data["chat"][idx]["chat_id"] = chat_id
-
-                # 只更新 last_read_message_id，不处理失败任务
-                # 失败任务已经单独存储在 failed_tasks.json 中
+                self.app_data["chat"][idx]["chat_id"] = str(chat_id)
 
                 # 更新配置中的 last_read_message_id（如果确实有进展）
-                if chat_config.last_read_message_id > 0:
+                if hasattr(chat_config, 'last_read_message_id') and chat_config.last_read_message_id > 0:
                     current_last_id = self.config["chat"][idx].get("last_read_message_id", 0)
-                    # 只向前更新，不后退
-                    if chat_config.last_read_message_id > current_last_id:
-                        self.config["chat"][idx]["last_read_message_id"] = chat_config.last_read_message_id
-                        logger.debug(
-                            f"更新聊天 {chat_id} 的 last_read_message_id 到 {chat_config.last_read_message_id}")
 
-            # 清理旧版配置项（这些应该已经迁移到新的结构）
+                    # 确保 chat_id 是字符串类型，方便比较
+                    if isinstance(chat_config.last_read_message_id, (int, str)):
+                        new_last_id = int(chat_config.last_read_message_id)
+                        current_last_id = int(current_last_id)
+
+                        # 只向前更新，不后退
+                        if new_last_id > current_last_id:
+                            self.config["chat"][idx]["last_read_message_id"] = new_last_id
+                            logger.info(
+                                f"更新聊天 {chat_id} 的 last_read_message_id: {current_last_id} -> {new_last_id}")
+                            updated_chats += 1
+                        else:
+                            logger.debug(
+                                f"聊天 {chat_id} 的 last_read_message_id 没有进展: 当前={current_last_id}, 新={new_last_id}")
+                    else:
+                        logger.warning(
+                            f"聊天 {chat_id} 的 last_read_message_id 类型错误: {type(chat_config.last_read_message_id)}")
+
+            # 清理旧版配置项
             old_keys = ["ids_to_retry", "chat_id", "download_filter"]
             for key in old_keys:
                 if key in self.config:
                     self.config.pop(key)
 
             # 更新语言配置
-            self.config["language"] = self.language.name
+            if hasattr(self, 'language'):
+                self.config["language"] = self.language.name
 
             # 立即写入配置
-            if immediate:
-                # 备份原始配置以防万一
-                config_backup = f"{self.config_file}.backup.{int(time.time())}"
-                if os.path.exists(self.config_file):
-                    shutil.copy2(self.config_file, config_backup)
-                    logger.debug(f"已备份配置到: {config_backup}")
+            if immediate and updated_chats > 0:
+                try:
+                    # 备份原始配置以防万一
+                    config_backup = f"{self.config_file}.backup.{int(time.time())}"
+                    if os.path.exists(self.config_file):
+                        # 创建备份目录
+                        backup_dir = os.path.dirname(config_backup)
+                        if backup_dir and not os.path.exists(backup_dir):
+                            os.makedirs(backup_dir, exist_ok=True)
 
-                # 写入新配置
-                with open(self.config_file, "w", encoding="utf-8") as yaml_file:
-                    _yaml.dump(self.config, yaml_file)
+                        shutil.copy2(self.config_file, config_backup)
+                        logger.info(f"已备份配置到: {config_backup}")
 
-                # 写入应用数据
-                with open(self.app_data_file, "w", encoding='utf-8') as yaml_file:
-                    _yaml.dump(self.app_data, yaml_file)
+                    # 写入新配置
+                    with open(self.config_file, "w", encoding="utf-8") as yaml_file:
+                        _yaml.dump(self.config, yaml_file)
+                    logger.success(f"配置更新成功，更新了 {updated_chats} 个聊天")
 
-                logger.info("配置更新成功")
+                    # 写入应用数据
+                    if self.app_data_file:
+                        with open(self.app_data_file, "w", encoding='utf-8') as yaml_file:
+                            _yaml.dump(self.app_data, yaml_file)
+                        logger.debug("应用数据更新成功")
+
+                    return True
+
+                except Exception as e:
+                    logger.error(f"写入配置文件失败: {e}")
+                    return False
+            else:
+                logger.info(f"没有聊天需要更新或 immediate=False，跳过写入配置")
+                return updated_chats > 0
 
         except Exception as e:
             logger.error(f"更新配置失败: {e}")
-            # 这里不抛出异常，避免影响程序退出
+            import traceback
+            logger.error(f"堆栈信息: {traceback.format_exc()}")
+            return False
 
     def set_language(self, language: Language):
         """Set Language"""
