@@ -339,6 +339,7 @@ class NotificationManager:
             f"失败任务(待重试): {stats.get('failed_tasks_pending', 0)}\n"
             f"下载大小: {stats.get('download_size_mb', 0):.2f}MB\n"
             f"磁盘可用: {stats.get('disk_available_gb', 0):.2f}GB/{stats.get('disk_total_gb', 0):.2f}GB\n"
+            f"下载目录大小: {stats.get('download_dir_size_gb', 0):.2f}GB\n"  # 新增这一行
             f"活动任务: {stats.get('active_tasks', 0)}\n"
             f"队列任务: {stats.get('queued_tasks', 0)}\n"
             f"空间不足: {'是' if stats.get('space_low', False) else '否'}"
@@ -1025,15 +1026,32 @@ async def collect_stats_async() -> Dict[str, Any]:
             except Exception as e:
                 logger.warning(f"加载失败任务统计失败 ({chat_id}): {e}")
 
+        # 获取下载目录大小（新增部分）- 使用app.save_path
+        download_dir_size_gb = 0
+        try:
+            # 从app.save_path获取下载目录路径
+            download_dir = app.save_path
+
+            if download_dir and os.path.exists(download_dir):
+                # 在单独的线程中计算目录大小，避免阻塞事件循环
+                download_dir_size = await asyncio.to_thread(calculate_directory_size, download_dir)
+                download_dir_size_gb = download_dir_size / (1024 ** 3)  # 转换为GB
+                logger.debug(f"下载目录 {download_dir} 大小: {download_dir_size_gb:.2f}GB")
+            elif download_dir:
+                logger.debug(f"下载目录不存在: {download_dir}")
+        except Exception as e:
+            logger.warning(f"计算下载目录大小失败: {e}")
+
         return {
             "uptime": uptime_str,
             "tasks_completed": tasks_completed,
             "tasks_failed": total_failed_tasks,
             "tasks_skipped": 0,
             "download_size_mb": disk_monitor.stats_since_last_notification["download_size"] / (
-                        1024 ** 2) if disk_monitor.stats_since_last_notification.get("download_size") else 0,
+                    1024 ** 2) if disk_monitor.stats_since_last_notification.get("download_size") else 0,
             "disk_available_gb": available_gb,
             "disk_total_gb": total_gb,
+            "download_dir_size_gb": download_dir_size_gb,  # 新增字段
             "active_tasks": getattr(app, 'max_download_task', 5) - len(disk_monitor.paused_workers),
             "queued_tasks": queued_tasks,
             "space_low": disk_monitor.space_low,
@@ -1060,6 +1078,33 @@ def collect_stats() -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"同步收集统计信息失败: {e}")
         return {}
+
+
+def calculate_directory_size(directory_path: str) -> int:
+    """
+    计算目录的总大小（字节）
+    """
+    total_size = 0
+    try:
+        path = Path(directory_path)
+
+        if not path.exists() or not path.is_dir():
+            return 0
+
+        # 使用 glob 递归遍历所有文件
+        for file_path in path.rglob('*'):
+            try:
+                if file_path.is_file():
+                    total_size += file_path.stat().st_size
+            except (OSError, PermissionError):
+                # 忽略无法访问的文件
+                continue
+    except Exception as e:
+        logger.warning(f"计算目录大小出错 {directory_path}: {e}")
+
+    return total_size
+
+
 
 
 def setup_exit_signal_handlers():
