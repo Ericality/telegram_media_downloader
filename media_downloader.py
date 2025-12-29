@@ -53,7 +53,7 @@ custom_theme = Theme({
 })
 console = Console(theme=custom_theme)
 
-# 配置RichHandler
+# 配置RichHandler - 初始设为INFO，后面会根据配置调整
 rich_handler = RichHandler(
     console=console,
     rich_tracebacks=True,
@@ -61,11 +61,12 @@ rich_handler = RichHandler(
     show_time=True,
     show_path=False,
     tracebacks_show_locals=False,
-    level=logging.DEBUG if os.environ.get("DEBUG") else logging.INFO
+    level=logging.INFO  # 先设为INFO，后面会根据配置调整
 )
 
+# 初始使用INFO级别，加载配置后会调整
 logging.basicConfig(
-    level=logging.DEBUG if os.environ.get("DEBUG") else logging.INFO,
+    level=logging.INFO,
     format="%(message)s",
     datefmt="[%X]",
     handlers=[rich_handler],
@@ -1137,7 +1138,27 @@ async def graceful_shutdown():
     app.is_running = False
     app.force_exit = True
 
-    # 2. 等待一小段时间让生产者停止
+    # 2. 发送关闭通知（先发送通知，再处理其他关闭逻辑）
+    try:
+        if notification_manager.should_notify("shutdown"):
+            shutdown_title = "程序停止"
+            shutdown_message = (
+                f"🛑 Telegram媒体下载器已停止\n"
+                f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"运行时间: {datetime.now() - disk_monitor.stats_start_time}\n"
+                f"完成任务: {app.total_download_task}"
+            )
+
+            # 给通知一点时间发送
+            notification_task = asyncio.create_task(
+                notification_manager.send_event_notification("shutdown", shutdown_title, shutdown_message)
+            )
+            await asyncio.wait_for(notification_task, timeout=10)
+            logger.info("关闭通知已发送")
+    except Exception as e:
+        logger.error(f"发送关闭通知失败: {e}")
+
+    # 3. 等待一小段时间让生产者停止
     await asyncio.sleep(1)
 
     # 3. 记录所有正在下载的任务和队列中的任务到失败列表
@@ -1964,6 +1985,8 @@ def _check_config() -> bool:
         # 根据配置设置日志级别
         log_level = app.log_level.upper() if hasattr(app, 'log_level') else "INFO"
 
+        logger.debug(f"设置日志级别为: {log_level}")
+
         # 添加控制台处理器
         logger.add(
             sys.stderr,
@@ -1985,13 +2008,18 @@ def _check_config() -> bool:
             diagnose=False
         )
 
-        # 设置DEBUG环境变量
+        # 设置Python标准logging的级别
         if log_level == "DEBUG":
             os.environ["DEBUG"] = "1"
             logging.getLogger().setLevel(logging.DEBUG)
         else:
-            os.environ.pop("DEBUG", None)
-            logging.getLogger().setLevel(logging.INFO)
+            if "DEBUG" in os.environ:
+                os.environ.pop("DEBUG")
+            logging.getLogger().setLevel(getattr(logging, log_level, logging.INFO))
+
+        # 立即验证日志级别
+        logger.debug(f"DEBUG日志测试 - 如果看到这一行，说明日志级别是DEBUG")
+        logger.info(f"INFO日志测试 - 程序启动，日志级别设置为: {log_level}")
 
         return True
     except Exception as e:
@@ -2761,6 +2789,30 @@ def main():
 
         # 加载通知管理器配置
         notification_manager.load_config()
+
+        # 发送启动通知（放在这里，确保通知系统已初始化）
+        async def send_startup_notification():
+            if notification_manager.should_notify("startup"):
+                startup_title = "程序启动"
+                startup_message = (
+                    f"🚀 Telegram媒体下载器已启动\n"
+                    f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"版本: 1.0.0\n"
+                    f"下载任务数: {len(app.chat_download_config)}\n"
+                    f"通知系统: {'已启用' if notification_manager.bark_enabled or notification_manager.synology_chat_enabled else '未启用'}"
+                )
+
+                # 测试通知是否正常
+                success = await notification_manager.send_event_notification(
+                    "startup", startup_title, startup_message
+                )
+                if success:
+                    logger.info("✅ 启动通知发送成功")
+                else:
+                    logger.warning("启动通知发送失败")
+
+        # 运行启动通知
+        app.loop.run_until_complete(send_startup_notification())
 
         # 设置全局异常处理器
         def global_exception_handler(loop, context):

@@ -581,30 +581,17 @@ class Application:
         # 处理聊天配置的过滤器
         self._process_chat_filters()
 
-        # 处理log_level
-        if 'log_level' in _config:
-            log_level = _config['log_level'].upper()
-            # 设置loguru的日志级别
-            try:
-                import sys
-                import loguru
-                # 移除现有处理器
-                logger.remove()
-                # 重新添加处理器
-                logger.add(
-                    sys.stderr,
-                    level=log_level,
-                    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
-                )
-                # 添加文件日志
-                logger.add(
-                    os.path.join(self.log_file_path, "tdl.log"),
-                    rotation="10 MB",
-                    retention="10 days",
-                    level=log_level,
-                )
-            except Exception as e:
-                logger.error(f"设置日志级别失败: {e}")
+        # 立即设置日志级别（确保立即生效）
+        if hasattr(self, 'log_level'):
+            import logging
+            log_level = self.log_level.upper()
+            if log_level == "DEBUG":
+                os.environ["DEBUG"] = "1"
+                logging.getLogger().setLevel(logging.DEBUG)
+            else:
+                if "DEBUG" in os.environ:
+                    os.environ.pop("DEBUG")
+                logging.getLogger().setLevel(getattr(logging, log_level, logging.INFO))
 
         return True
 
