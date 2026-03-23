@@ -569,6 +569,14 @@ class Application:
         # 处理通用配置项
         self._process_general_configs(_config)
 
+        # 新增：处理未在架构中定义的配置项
+        known_keys = set(ConfigSchema.BASE_CONFIG.keys()) | set(ConfigSchema.NOTIFICATION_CONFIG.keys())
+        for key, value in _config.items():
+            if key not in known_keys and not hasattr(self, key):
+                # 对于未知配置项，直接设置为属性
+                setattr(self, key, value)
+                logger.debug(f"加载未声明配置项 {key}: {value}")
+
         # 处理聊天配置
         self._process_chat_configs(_config)
 
