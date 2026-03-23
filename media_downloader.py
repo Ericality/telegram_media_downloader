@@ -2036,12 +2036,12 @@ async def download_worker(client: pyrogram.client.Client, worker_id: int):
 
 async def download_chat_task(
         client: pyrogram.Client,
+        chat_id: Union[int, str],
         chat_download_config: ChatDownloadConfig,
         node: TaskNode,
 ):
     """仅负责添加新消息（失败任务由 retry_producer 负责）"""
     try:
-        chat_id = node.chat_id  # 使用 node 中的聊天 ID
         logger.info(f"开始处理聊天 {chat_id}，last_read_message_id={chat_download_config.last_read_message_id}")
 
         # 获取新消息
@@ -2124,7 +2124,6 @@ async def download_all_chat(client: pyrogram.Client):
     # 第一步：为每个聊天创建 TaskNode（如果尚未创建）
     for chat_id, value in app.chat_download_config.items():
         if value.node is None:
-            # 关键修改：传入正确的 chat_id
             value.node = TaskNode(chat_id=chat_id)
 
     # 第二步：启动重试生产者（常驻）
@@ -2137,7 +2136,8 @@ async def download_all_chat(client: pyrogram.Client):
     # 第三步：启动新消息生产者（每个聊天一个，完成后会退出）
     new_msg_tasks = []
     for chat_id, value in app.chat_download_config.items():
-        task = app.loop.create_task(download_chat_task(client, value, value.node))
+        # 传入显式的 chat_id 参数
+        task = app.loop.create_task(download_chat_task(client, chat_id, value, value.node))
         new_msg_tasks.append(task)
 
     # 等待新消息生产者全部完成
