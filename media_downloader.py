@@ -2061,76 +2061,84 @@ async def download_chat_task(
         node: TaskNode,
 ):
     """仅负责添加新消息（失败任务由 retry_producer 负责）"""
-    # 获取新消息
-    messages_iter = get_chat_history_v2(
-        client,
-        node.chat_id,
-        limit=node.limit,
-        max_id=node.end_offset_id,
-        offset_id=chat_download_config.last_read_message_id,
-        reverse=True,
-    )
+    try:
+        logger.info(f"开始处理聊天 {node.chat_id}，last_read_message_id={chat_download_config.last_read_message_id}")
 
-    chat_download_config.node = node
+        # 获取新消息
+        messages_iter = get_chat_history_v2(
+            client,
+            node.chat_id,
+            limit=node.limit,
+            max_id=node.end_offset_id,
+            offset_id=chat_download_config.last_read_message_id,
+            reverse=True,
+        )
 
-    # 主消息迭代器处理
-    batch_messages = []
-    batch_size = queue_manager.download_queue_size
+        chat_download_config.node = node
 
-    async for message in messages_iter:
-        # 检查是否应该跳过
-        if app.need_skip_message(chat_download_config, message.id):
-            continue
+        batch_messages = []
+        batch_size = queue_manager.download_queue_size
 
-        # 检查是否匹配过滤器
-        meta_data = MetaData()
-        caption = message.caption
-        if caption:
-            caption = validate_title(caption)
-            app.set_caption_name(node.chat_id, message.media_group_id, caption)
-            app.set_caption_entities(
-                node.chat_id, message.media_group_id, message.caption_entities
-            )
-        else:
-            caption = app.get_caption_name(node.chat_id, message.media_group_id)
-        set_meta_data(meta_data, message, caption)
+        async for message in messages_iter:
+            logger.debug(f"处理消息 {message.id}")
 
-        if app.exec_filter(chat_download_config, meta_data):
-            batch_messages.append(message)
+            # 检查是否应该跳过
+            if app.need_skip_message(chat_download_config, message.id):
+                continue
 
-            # 当收集到足够的消息时，批量添加
-            if len(batch_messages) >= batch_size:
-                added = await add_download_task_batch(batch_messages, node)
-                batch_messages = []
-
-                if node.total_task % 100 == 0:
-                    logger.info(f"已添加 {node.total_task} 个新任务到队列...")
-
-                # 检查是否要退出
-                if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
-                    logger.info(f"生产者收到退出信号，停止添加新任务")
-                    break
-        else:
-            node.download_status[message.id] = DownloadStatus.SkipDownload
-            if message.media_group_id:
-                await upload_telegram_chat(
-                    client,
-                    node.upload_user,
-                    app,
-                    node,
-                    message,
-                    DownloadStatus.SkipDownload,
+            # 检查是否匹配过滤器
+            meta_data = MetaData()
+            caption = message.caption
+            if caption:
+                caption = validate_title(caption)
+                app.set_caption_name(node.chat_id, message.media_group_id, caption)
+                app.set_caption_entities(
+                    node.chat_id, message.media_group_id, message.caption_entities
                 )
+            else:
+                caption = app.get_caption_name(node.chat_id, message.media_group_id)
+            set_meta_data(meta_data, message, caption)
 
-    # 添加剩余的消息
-    if batch_messages and not getattr(app, 'force_exit', False):
-        added = await add_download_task_batch(batch_messages, node)
+            if app.exec_filter(chat_download_config, meta_data):
+                batch_messages.append(message)
 
-    chat_download_config.need_check = True
-    chat_download_config.total_task = node.total_task
-    node.is_running = True
+                if len(batch_messages) >= batch_size:
+                    logger.info(f"批量添加 {len(batch_messages)} 个消息...")
+                    added = await add_download_task_batch(batch_messages, node)
+                    batch_messages = []
 
-    logger.info(f"新消息添加完成，共 {node.total_task} 个新任务等待下载")
+                    if node.total_task % 100 == 0:
+                        logger.info(f"已添加 {node.total_task} 个新任务到队列...")
+
+                    if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
+                        logger.info(f"生产者收到退出信号，停止添加新任务")
+                        break
+            else:
+                node.download_status[message.id] = DownloadStatus.SkipDownload
+                if message.media_group_id:
+                    await upload_telegram_chat(
+                        client,
+                        node.upload_user,
+                        app,
+                        node,
+                        message,
+                        DownloadStatus.SkipDownload,
+                    )
+
+        # 添加剩余的消息
+        if batch_messages and not getattr(app, 'force_exit', False):
+            logger.info(f"添加剩余 {len(batch_messages)} 个消息...")
+            added = await add_download_task_batch(batch_messages, node)
+
+        chat_download_config.need_check = True
+        chat_download_config.total_task = node.total_task
+        node.is_running = True
+
+        logger.info(f"聊天 {node.chat_id} 新消息处理完成，共添加 {node.total_task} 个新任务")
+    except Exception as e:
+        logger.exception(f"聊天 {node.chat_id} 下载任务处理异常: {e}")
+        # 确保 need_check 标记为 True，避免主循环一直等待
+        chat_download_config.need_check = True
 
 async def download_all_chat(client: pyrogram.Client):
     """下载所有聊天 - 同时启动新消息生产者和重试生产者"""
