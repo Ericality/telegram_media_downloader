@@ -21,6 +21,9 @@ _total_download_size: int = 0
 _last_download_time: float = time.time()
 _download_state: DownloadState = DownloadState.Downloading
 
+# 添加异步锁保护共享字典
+_lock = asyncio.Lock()
+
 
 def get_download_result() -> dict:
     """get global download result"""
@@ -42,6 +45,16 @@ def set_download_state(state: DownloadState):
     """set download state"""
     global _download_state
     _download_state = state
+
+
+async def remove_download_record(chat_id, message_id):
+    """从下载结果字典中移除指定任务（异步安全）"""
+    async with _lock:
+        if chat_id in _download_result:
+            if message_id in _download_result[chat_id]:
+                del _download_result[chat_id][message_id]
+            if not _download_result[chat_id]:
+                del _download_result[chat_id]
 
 
 async def update_download_status(
@@ -70,50 +83,51 @@ async def update_download_status(
             client.stop_transmission()
         await asyncio.sleep(1)
 
-    if not _download_result.get(chat_id):
-        _download_result[chat_id] = {}
+    async with _lock:
+        if not _download_result.get(chat_id):
+            _download_result[chat_id] = {}
 
-    if _download_result[chat_id].get(message_id):
-        last_download_byte = _download_result[chat_id][message_id]["down_byte"]
-        last_time = _download_result[chat_id][message_id]["end_time"]
-        download_speed = _download_result[chat_id][message_id]["download_speed"]
-        each_second_total_download = _download_result[chat_id][message_id][
-            "each_second_total_download"
-        ]
-        end_time = _download_result[chat_id][message_id]["end_time"]
+        if _download_result[chat_id].get(message_id):
+            last_download_byte = _download_result[chat_id][message_id]["down_byte"]
+            last_time = _download_result[chat_id][message_id]["end_time"]
+            download_speed = _download_result[chat_id][message_id]["download_speed"]
+            each_second_total_download = _download_result[chat_id][message_id][
+                "each_second_total_download"
+            ]
+            end_time = _download_result[chat_id][message_id]["end_time"]
 
-        _total_download_size += down_byte - last_download_byte
-        each_second_total_download += down_byte - last_download_byte
+            _total_download_size += down_byte - last_download_byte
+            each_second_total_download += down_byte - last_download_byte
 
-        if cur_time - last_time >= 1.0:
-            download_speed = int(each_second_total_download / (cur_time - last_time))
-            end_time = cur_time
-            each_second_total_download = 0
+            if cur_time - last_time >= 1.0:
+                download_speed = int(each_second_total_download / (cur_time - last_time))
+                end_time = cur_time
+                each_second_total_download = 0
 
-        download_speed = max(download_speed, 0)
+            download_speed = max(download_speed, 0)
 
-        _download_result[chat_id][message_id]["down_byte"] = down_byte
-        _download_result[chat_id][message_id]["end_time"] = end_time
-        _download_result[chat_id][message_id]["download_speed"] = download_speed
-        _download_result[chat_id][message_id][
-            "each_second_total_download"
-        ] = each_second_total_download
-    else:
-        each_second_total_download = down_byte
-        _download_result[chat_id][message_id] = {
-            "down_byte": down_byte,
-            "total_size": total_size,
-            "file_name": file_name,
-            "start_time": start_time,
-            "end_time": cur_time,
-            "download_speed": down_byte / (cur_time - start_time),
-            "each_second_total_download": each_second_total_download,
-            "task_id": node.task_id,
-        }
-        _total_download_size += down_byte
+            _download_result[chat_id][message_id]["down_byte"] = down_byte
+            _download_result[chat_id][message_id]["end_time"] = end_time
+            _download_result[chat_id][message_id]["download_speed"] = download_speed
+            _download_result[chat_id][message_id][
+                "each_second_total_download"
+            ] = each_second_total_download
+        else:
+            each_second_total_download = down_byte
+            _download_result[chat_id][message_id] = {
+                "down_byte": down_byte,
+                "total_size": total_size,
+                "file_name": file_name,
+                "start_time": start_time,
+                "end_time": cur_time,
+                "download_speed": down_byte / (cur_time - start_time),
+                "each_second_total_download": each_second_total_download,
+                "task_id": node.task_id,
+            }
+            _total_download_size += down_byte
 
+    # 速度统计部分不需要锁保护（只读/写全局变量，且更新频率低，用普通变量即可）
     if cur_time - _last_download_time >= 1.0:
-        # update speed
         _total_download_speed = int(
             _total_download_size / (cur_time - _last_download_time)
         )

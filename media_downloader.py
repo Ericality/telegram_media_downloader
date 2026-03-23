@@ -1670,67 +1670,69 @@ async def save_msg_to_file(
     return DownloadStatus.SuccessDownload, file_name
 
 
-async def download_task(
-        client: pyrogram.Client, message: pyrogram.types.Message, node: TaskNode
-):
+async def download_task(client, message, node):
     """下载和转发媒体"""
-    original_download_status, file_name = await download_media(
-        client, message, app.media_types, app.file_formats, node
-    )
+    try:
+        original_download_status, file_name = await download_media(
+            client, message, app.media_types, app.file_formats, node
+        )
 
-    # 如果下载成功，从失败列表中移除
-    if original_download_status == DownloadStatus.SuccessDownload:
-        await remove_failed_task(node.chat_id, message.id)
+        if original_download_status == DownloadStatus.SuccessDownload:
+            await remove_failed_task(node.chat_id, message.id)
 
-    if file_name and os.path.exists(file_name):
-        try:
-            file_size = os.path.getsize(file_name)
-            disk_monitor.stats_since_last_notification["download_size"] += file_size
-        except:
-            pass
+        if file_name and os.path.exists(file_name):
+            try:
+                file_size = os.path.getsize(file_name)
+                disk_monitor.stats_since_last_notification["download_size"] += file_size
+            except:
+                pass
 
-    if app.enable_download_txt and message.text and not message.media:
-        download_status, file_name = await save_msg_to_file(app, node.chat_id, message)
-    else:
-        download_status, file_name = original_download_status, file_name
+        if app.enable_download_txt and message.text and not message.media:
+            download_status, file_name = await save_msg_to_file(app, node.chat_id, message)
+        else:
+            download_status, file_name = original_download_status, file_name
 
-    if not node.bot:
-        app.set_download_id(node, message.id, download_status)
+        if not node.bot:
+            app.set_download_id(node, message.id, download_status)
 
-    node.download_status[message.id] = download_status
-    file_size = os.path.getsize(file_name) if file_name else 0
+        node.download_status[message.id] = download_status
+        file_size = os.path.getsize(file_name) if file_name else 0
 
-    await upload_telegram_chat(
-        client,
-        node.upload_user if node.upload_user else client,
-        app,
-        node,
-        message,
-        download_status,
-        file_name,
-    )
+        await upload_telegram_chat(
+            client,
+            node.upload_user if node.upload_user else client,
+            app,
+            node,
+            message,
+            download_status,
+            file_name,
+        )
 
-    if (
-            not node.upload_telegram_chat_id
-            and download_status is DownloadStatus.SuccessDownload
-    ):
-        ui_file_name = file_name
-        if app.hide_file_name:
-            ui_file_name = f"****{os.path.splitext(file_name)[-1]}"
-        if await app.upload_file(
+        if not node.upload_telegram_chat_id and download_status is DownloadStatus.SuccessDownload:
+            ui_file_name = file_name
+            if app.hide_file_name:
+                ui_file_name = f"****{os.path.splitext(file_name)[-1]}"
+            if await app.upload_file(
                 file_name, update_cloud_upload_stat, (node, message.id, ui_file_name)
-        ):
-            node.upload_success_count += 1
+            ):
+                node.upload_success_count += 1
 
-    await report_bot_download_status(
-        node.bot,
-        node,
-        download_status,
-        file_size,
-    )
+        await report_bot_download_status(
+            node.bot,
+            node,
+            download_status,
+            file_size,
+        )
 
-    queue_manager.task_processed += 1
+        queue_manager.task_processed += 1
 
+    finally:
+        # 从 download_result 中移除该任务，避免前端显示残留
+        try:
+            from module.download_stat import remove_download_record
+            await remove_download_record(node.chat_id, message.id)
+        except Exception as e:
+            logger.error(f"清除下载记录失败: {e}")
 
 @record_download_status
 async def download_media(
