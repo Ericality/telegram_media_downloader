@@ -2100,7 +2100,7 @@ async def download_chat_task(
 
             # 当收集到足够的消息时，批量添加
             if len(batch_messages) >= batch_size:
-                added = await add_download_task_batch(batch_messages, node, min(batch_size, len(batch_messages)))
+                added = await add_download_task_batch(batch_messages, node)
                 batch_messages = []
 
                 if node.total_task % 100 == 0:
@@ -2124,7 +2124,7 @@ async def download_chat_task(
 
     # 添加剩余的消息
     if batch_messages and not getattr(app, 'force_exit', False):
-        added = await add_download_task_batch(batch_messages, node, len(batch_messages))
+        added = await add_download_task_batch(batch_messages, node)
 
     chat_download_config.need_check = True
     chat_download_config.total_task = node.total_task
