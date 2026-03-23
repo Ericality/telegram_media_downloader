@@ -1537,185 +1537,114 @@ async def add_download_task(
         node: TaskNode,
         max_wait_time: int = 3600  # 默认最长等待1小时，超时后告警但继续等待
 ) -> bool:
-    """添加下载任务到队列（队列满时无限等待）"""
+    """添加下载任务到队列（使用Queue.put阻塞）"""
     if message.empty:
         return False
 
     start_time = time.time()
     last_notification_time = 0
-    notification_interval = 3600
 
     while True:
-        # 首先检查是否要退出
+        # 检查退出信号
         if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
             logger.debug(f"程序正在退出，跳过添加任务: message_id={message.id}")
             return False
 
         try:
-            # 检查队列是否有空位
-            current_size = download_queue.qsize()
-            queue_capacity = queue_manager.download_queue_size
+            # 使用wait_for实现带超时的put，避免永久阻塞
+            await asyncio.wait_for(download_queue.put((message, node)), timeout=1.0)
 
-            if current_size < queue_capacity:
-                # 有空位，添加任务
-                async with queue_manager.lock:
-                    if current_size < queue_capacity:  # 双重检查
-                        # 再次检查是否要退出
-                        if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
-                            logger.debug(f"程序正在退出，跳过添加任务: message_id={message.id}")
-                            return False
+            # 成功添加，更新状态
+            async with queue_manager.lock:
+                node.download_status[message.id] = DownloadStatus.Downloading
+                node.total_task += 1
+                queue_manager.task_added += 1
 
-                        # 标记为下载中
-                        node.download_status[message.id] = DownloadStatus.Downloading
-                        # 立即更新聊天配置的 last_read_message_id
-                        chat_id_str = str(node.chat_id)
-                        chat_config = app.chat_download_config.get(node.chat_id) or app.chat_download_config.get(
-                            chat_id_str)
+                # 更新 last_read_message_id
+                chat_id_str = str(node.chat_id)
+                chat_config = app.chat_download_config.get(node.chat_id) or app.chat_download_config.get(chat_id_str)
+                if chat_config:
+                    try:
+                        message_id_int = int(message.id)
+                        current_last_id = getattr(chat_config, 'last_read_message_id', 0)
+                        if current_last_id is None:
+                            current_last_id = 0
+                        current_last_id = int(current_last_id)
+                        if message_id_int > current_last_id:
+                            chat_config.last_read_message_id = message_id_int
+                            logger.debug(f"更新聊天 {node.chat_id} 的 last_read_message_id 到 {message_id_int}")
+                    except (ValueError, TypeError) as e:
+                        logger.error(f"更新 last_read_message_id 时出错: {e}")
 
-                        if chat_config:
-                            try:
-                                message_id_int = int(message.id)
-                                current_last_id = getattr(chat_config, 'last_read_message_id', 0)
+            logger.debug(f"已添加下载任务: message_id={message.id}, 队列大小={download_queue.qsize()}")
+            return True
 
-                                if current_last_id is None:
-                                    current_last_id = 0
-
-                                current_last_id = int(current_last_id)
-
-                                # 只向前更新
-                                if message_id_int > current_last_id:
-                                    chat_config.last_read_message_id = message_id_int
-                                    logger.debug(f"更新聊天 {node.chat_id} 的 last_read_message_id 到 {message_id_int}")
-                                    logger.debug(
-                                        f"聊天配置: {chat_id_str}, 消息ID: {message.id}, 类型: {type(message.id)}")
-                            except (ValueError, TypeError) as e:
-                                logger.error(
-                                    f"更新 last_read_message_id 时出错: {e}, chat_id={node.chat_id}, message_id={message.id}")
-
-                        # 添加任务到队列
-                        await download_queue.put((message, node))
-                        node.total_task += 1
-                        queue_manager.task_added += 1
-
-                        logger.debug(
-                            f"已添加下载任务: message_id={message.id}, "
-                            f"队列大小={download_queue.qsize()}/{queue_capacity}"
-                        )
-                        return True
-
-            # 队列满，等待
+        except asyncio.TimeoutError:
+            # 超时，检查等待时间并发送通知
             current_wait_time = time.time() - start_time
+            queue_capacity = queue_manager.download_queue_size
+            current_size = download_queue.qsize()
 
-            # 如果等待时间超过30秒，每30秒记录一次等待状态
+            # 每30秒记录一次等待状态
             if current_wait_time > 30 and int(current_wait_time) % 30 == 0:
                 logger.debug(f"队列满，等待任务添加: message_id={message.id}, 已等待{int(current_wait_time)}秒")
 
-            # 如果等待时间超过1小时，发送告警通知（每小时一次）
-            if current_wait_time > max_wait_time:
-                current_time = time.time()
-                if current_time - last_notification_time > notification_interval:
-                    # 发送队列满载通知
-                    wait_minutes = int(current_wait_time / 60)
-                    await notification_manager.send_queue_notification(
-                        current_size, queue_capacity, wait_minutes
-                    )
+            # 超过1小时发送告警（每小时一次）
+            if current_wait_time > max_wait_time and current_wait_time - last_notification_time > 3600:
+                wait_minutes = int(current_wait_time / 60)
+                await notification_manager.send_queue_notification(
+                    current_size, queue_capacity, wait_minutes
+                )
+                last_notification_time = current_wait_time
+                logger.warning(f"任务添加等待时间过长: message_id={message.id}, 已等待{wait_minutes}分钟")
 
-                    last_notification_time = current_time
-                    logger.warning(f"任务添加等待时间过长: message_id={message.id}, 已等待{wait_minutes}分钟")
-
-            # 等待一段时间再检查，但检查退出状态
-            for _ in range(10):  # 每0.1秒检查一次，总共1秒
-                await asyncio.sleep(0.1)
-                if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
-                    logger.debug(f"程序正在退出，跳过添加任务: message_id={message.id}")
-                    return False
+            # 继续循环重试
+            continue
 
         except asyncio.CancelledError:
             logger.info(f"添加任务被取消: message_id={message.id}")
-            # 如果被取消，记录到失败列表，等待后续重试
             await record_failed_task(node.chat_id, message.id, "添加任务被取消")
             return False
         except Exception as e:
             logger.error(f"添加下载任务异常: {e}")
-
-            # 检查是否要退出
-            if getattr(app, 'force_exit', False) or not getattr(app, 'is_running', True):
-                logger.debug(f"程序正在退出，跳过添加任务: message_id={message.id}")
-                return False
-
-            # 等待后继续尝试
-            await asyncio.sleep(5)
-
-    return False
+            await record_failed_task(node.chat_id, message.id, f"添加异常: {e}")
+            return False
 
 
 async def add_download_task_batch(
         messages: List[pyrogram.types.Message],
         node: TaskNode,
-        max_concurrent: int = 5
+
 ) -> int:
-    """批量添加下载任务（使用并发控制）"""
+    """批量添加下载任务（顺序添加，保证队列容量限制）"""
     # 检查程序是否在运行
     if not getattr(app, 'is_running', True) or getattr(app, 'force_exit', False):
-        logger.debug("程序不在运行状态，跳过批量添加，并记录所有任务到失败列表")
-
-        # 记录所有未添加的任务到失败列表
+        logger.debug("程序不在运行状态，跳过批量添加")
         for msg in messages:
             if msg:
                 await record_failed_task(node.chat_id, msg.id, "程序退出，批量添加被跳过")
-
         return 0
 
     if not messages:
         return 0
 
     added_count = 0
-    failed_count = 0
-
-    # 使用信号量控制并发
-    semaphore = asyncio.Semaphore(max_concurrent)
-
-    async def add_single_task(msg):
-        """添加单个任务的协程"""
-        nonlocal added_count, failed_count
-
-        # 检查程序是否在运行
-        if not getattr(app, 'is_running', True) or getattr(app, 'force_exit', False):
-            logger.debug(f"程序不在运行状态，记录任务到失败列表: message_id={msg.id}")
-            failed_count += 1
-            await record_failed_task(node.chat_id, msg.id, "程序退出，任务未添加到队列")
-            return
-
+    # 顺序添加每个任务，add_download_task内部会阻塞直到有空位
+    for msg in messages:
+        if msg is None:
+            continue
         try:
-            async with semaphore:
-                success = await add_download_task(msg, node)
-                if success:
-                    added_count += 1
-                else:
-                    failed_count += 1
+            success = await add_download_task(msg, node)
+            if success:
+                added_count += 1
         except Exception as e:
             logger.error(f"添加任务失败: message_id={msg.id}, 错误: {e}")
-            failed_count += 1
             await record_failed_task(node.chat_id, msg.id, f"批量添加异常: {e}")
 
-    # 创建所有任务
-    tasks = [add_single_task(msg) for msg in messages if msg]
-
-    # 等待所有任务完成
-    try:
-        await asyncio.gather(*tasks, return_exceptions=True)
-    except asyncio.CancelledError:
-        logger.warning("批量添加任务被取消")
-        # 记录剩余未处理的任务
-        for msg in messages[added_count + failed_count:]:
-            if msg:
-                await record_failed_task(node.chat_id, msg.id, "批量添加被取消")
-
-    if failed_count > 0:
-        logger.warning(f"批量添加完成: 成功 {added_count} 个，失败 {failed_count} 个")
+    if added_count < len(messages):
+        logger.warning(f"批量添加完成: 成功 {added_count} 个，失败 {len(messages) - added_count} 个")
     else:
         logger.info(f"批量添加完成: 成功添加 {added_count} 个任务")
-
     return added_count
 
 
@@ -2151,7 +2080,7 @@ async def download_chat_task(
             # 过滤有效消息
             valid_messages = [msg for msg in messages if msg is not None]
             if valid_messages:
-                added = await add_download_task_batch(valid_messages, node, len(valid_messages))
+                added = await add_download_task_batch(valid_messages, node)
                 logger.info(f"已重试 {added}/{len(valid_messages)} 个失败任务")
 
                 # 移除成功获取的消息对应的失败记录
@@ -2200,7 +2129,7 @@ async def download_chat_task(
 
             # 当收集到足够的消息时，批量添加
             if len(batch_messages) >= batch_size:
-                added = await add_download_task_batch(batch_messages, node, min(batch_size, len(batch_messages)))
+                added = await add_download_task_batch(batch_messages, node)
                 batch_messages = []
 
                 if node.total_task % 100 == 0:
@@ -2224,7 +2153,7 @@ async def download_chat_task(
 
     # 添加剩余的消息
     if batch_messages and not getattr(app, 'force_exit', False):
-        added = await add_download_task_batch(batch_messages, node, len(batch_messages))
+        added = await add_download_task_batch(batch_messages, node)
 
     chat_download_config.need_check = True
     chat_download_config.total_task = node.total_task
@@ -2251,7 +2180,7 @@ async def download_all_chat(client: pyrogram.Client):
                     valid_messages = [msg for msg in messages if msg is not None]
 
                     if valid_messages:
-                        added = await add_download_task_batch(valid_messages, node, len(valid_messages))
+                        added = await add_download_task_batch(valid_messages, node)
                         logger.info(f"聊天 {chat_id}: 已添加 {added} 个失败任务重试")
 
                         # 移除成功获取的消息对应的失败记录
@@ -2413,7 +2342,7 @@ async def retry_failed_tasks(
             return len(failed_tasks[:max_batch]), 0
 
         # 添加到下载队列
-        added = await add_download_task_batch(valid_messages, node, len(valid_messages))
+        added = await add_download_task_batch(valid_messages, node)
 
         if added > 0:
             logger.info(f"已为聊天 {chat_id} 重试 {added}/{len(valid_messages)} 个失败任务")
