@@ -1512,6 +1512,9 @@ async def add_download_task(
                         except (ValueError, TypeError) as e:
                             logger.error(f"更新 last_read_message_id 时出错: {e}")
 
+            # 关键修改：任务已加入队列，无论是否重试，都从失败列表中移除
+            await remove_failed_task(node.chat_id, message.id)
+
             logger.debug(f"已添加{'重试' if is_retry else ''}下载任务: message_id={message.id}, 队列大小={download_queue.qsize()}")
             return True
 
