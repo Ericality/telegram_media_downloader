@@ -1686,8 +1686,10 @@ async def download_task(client, message, node):
             download_status,
             file_name,
         )
-
+        logger.debug(
+            f"检查上传条件: node.upload_telegram_chat_id={node.upload_telegram_chat_id}, download_status={download_status}")
         if not node.upload_telegram_chat_id and download_status is DownloadStatus.SuccessDownload:
+            logger.info(f"开始上传文件: {file_name}")
             ui_file_name = file_name
             if app.hide_file_name:
                 ui_file_name = f"****{os.path.splitext(file_name)[-1]}"
@@ -1695,6 +1697,8 @@ async def download_task(client, message, node):
                 file_name, update_cloud_upload_stat, (node, message.id, ui_file_name)
             ):
                 node.upload_success_count += 1
+        else:
+            logger.debug(f"跳过上传，条件不满足, chat_id:{node.upload_telegram_chat_id}, download_status={download_status}")
 
         await report_bot_download_status(
             node.bot,
