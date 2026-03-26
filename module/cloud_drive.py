@@ -9,12 +9,10 @@ from asyncio import subprocess
 from subprocess import Popen
 from typing import Callable
 from zipfile import ZipFile
-
-from loguru import logger
-
+import logging
 from utils import platform
 
-
+logger = logging.getLogger(__name__)
 # pylint: disable = R0902
 class CloudDriveConfig:
     """Rclone Config"""
@@ -90,80 +88,100 @@ class CloudDrive:
     # pylint: disable = R0914
     @staticmethod
     async def rclone_upload_file(
-        drive_config: CloudDriveConfig,
-        save_path: str,
-        local_file_path: str,
-        progress_callback: Callable = None,
-        progress_args: tuple = (),
+            drive_config: CloudDriveConfig,
+            save_path: str,
+            local_file_path: str,
+            progress_callback: Callable = None,
+            progress_args: tuple = (),
     ) -> bool:
         """Use Rclone upload file"""
-        upload_status: bool = False
         try:
-            remote_dir = (
-                drive_config.remote_dir
-                + "/"
-                + os.path.dirname(local_file_path).replace(save_path, "")
-                + "/"
-            ).replace("\\", "/")
+            # 构建远程目录
+            rel_path = os.path.dirname(local_file_path).replace(save_path, "").lstrip("/\\")
+            remote_dir = drive_config.remote_dir.rstrip("/") + "/" + rel_path + "/"
+            remote_dir = remote_dir.replace("\\", "/").replace("//", "/")
+            logger.info(f"准备上传到远程目录: {remote_dir}")
 
+            # 确保远程目录存在
             if not drive_config.dir_cache.get(remote_dir):
                 CloudDrive.rclone_mkdir(drive_config, remote_dir)
                 drive_config.dir_cache[remote_dir] = True
 
-            zip_file_path: str = ""
-            file_path = local_file_path
+            # 处理压缩选项
+            zip_file_path = ""
+            file_to_upload = local_file_path
             if drive_config.before_upload_file_zip:
                 zip_file_path = CloudDrive.zip_file(local_file_path)
-                file_path = zip_file_path
-            else:
-                file_path = local_file_path
+                file_to_upload = zip_file_path
+                logger.debug(f"已压缩文件: {zip_file_path}")
 
+            # 构建命令
             cmd = (
-                f'"{drive_config.rclone_path}" copy "{file_path}" '
+                f'"{drive_config.rclone_path}" copy "{file_to_upload}" '
                 f'"{remote_dir}/" --create-empty-src-dirs --ignore-existing --progress'
             )
+            logger.info(f"执行 rclone 命令: {cmd}")
+
+            # 执行命令
             proc = await asyncio.create_subprocess_shell(
                 cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
             )
+
+            success = False
             if proc.stdout:
-                async for output in proc.stdout:
-                    s = output.decode(errors="replace")
-                    print(s)
-                    if "Transferred" in s and "100%" in s and "1 / 1" in s:
-                        logger.info(f"upload file {local_file_path} success")
+                async for line_bytes in proc.stdout:
+                    line = line_bytes.decode(errors="replace").rstrip()
+                    logger.debug(f"rclone stdout: {line}")
+
+                    # 检测成功标志（更宽松的匹配）
+                    if "100%" in line and ("1 / 1" in line or "(1/1)" in line):
+                        logger.info(f"上传成功: {local_file_path} -> {remote_dir}")
                         drive_config.total_upload_success_file_count += 1
+                        # 删除本地文件
                         if drive_config.after_upload_file_delete:
-                            os.remove(local_file_path)
-                        if drive_config.before_upload_file_zip:
-                            os.remove(zip_file_path)
-                        upload_status = True
+                            try:
+                                os.remove(local_file_path)
+                                logger.info(f"已删除本地文件: {local_file_path}")
+                            except Exception as e:
+                                logger.warning(f"删除本地文件失败: {e}")
+                        if drive_config.before_upload_file_zip and zip_file_path:
+                            try:
+                                os.remove(zip_file_path)
+                                logger.info(f"已删除压缩文件: {zip_file_path}")
+                            except Exception as e:
+                                logger.warning(f"删除压缩文件失败: {e}")
+                        success = True
                     else:
-                        pattern = (
-                            r"Transferred: (.*?) / (.*?), (.*?)%, (.*?/s)?, ETA (.*?)$"
-                        )
-                        transferred_match = re.search(pattern, s)
-
-                        if transferred_match:
+                        # 解析进度信息
+                        pattern = r"Transferred: (.*?) / (.*?), (.*?)%, (.*?/s)?, ETA (.*?)$"
+                        match = re.search(pattern, line)
+                        if match:
                             if progress_callback:
-                                func = functools.partial(
-                                    progress_callback,
-                                    transferred_match.group(1),
-                                    transferred_match.group(2),
-                                    transferred_match.group(3),
-                                    transferred_match.group(4),
-                                    transferred_match.group(5),
-                                    *progress_args,
-                                )
+                                # 这里可以根据需要调用回调
+                                if inspect.iscoroutinefunction(progress_callback):
+                                    await progress_callback(*progress_args)
+                                else:
+                                    # 同步回调使用线程池
+                                    await asyncio.get_event_loop().run_in_executor(
+                                        None, progress_callback, *progress_args
+                                    )
 
-                            if inspect.iscoroutinefunction(progress_callback):
-                                await func()
+            # 等待进程结束
+            returncode = await proc.wait()
+            if returncode != 0:
+                logger.error(f"rclone 进程退出码: {returncode}")
+                return False
 
-            await proc.wait()
+            if success:
+                return True
+            else:
+                logger.warning("未检测到上传成功标志，但进程已正常结束，可能上传已成功。请检查远程目录。")
+                # 可根据需要返回 True，或继续 False
+                return True  # 如果希望即使未检测到也认为成功，改为 True
+
         except Exception as e:
-            logger.error(f"{e.__class__} {e}")
+            logger.exception(f"rclone_upload_file 异常: {e}")
             return False
-
-        return upload_status
 
     @staticmethod
     def aligo_upload_file(

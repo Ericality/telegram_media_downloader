@@ -189,33 +189,35 @@ def get_download_list():
     download_result = get_download_result()
     result = "["
     for chat_id, messages in download_result.items():
-        for idx, value in messages.items():
-            is_already_down = value["down_byte"] == value["total_size"]
+        for msg_id, info in messages.items():
+            total_size = info["total_size"]
+            down_byte = info["down_byte"]
+            is_completed = (down_byte == total_size)
 
-            if already_down and not is_already_down:
+            # 根据 already_down 参数决定显示已完成的还是未完成的
+            if already_down and not is_completed:
                 continue
+            if not already_down and is_completed:
+                continue
+
+            # 如果是未完成的任务，且该任务在失败列表中，则跳过（不显示）
+            if not already_down:
+                task_key = f"{chat_id}:{msg_id}"
+                if task_key in failed_task_ids:
+                    continue
 
             if result != "[":
                 result += ","
-            download_speed = format_byte(value["download_speed"]) + "/s"
+            download_speed = format_byte(info["download_speed"]) + "/s"
             result += (
-                '{ "chat":"'
-                + f"{chat_id}"
-                + '", "id":"'
-                + f"{idx}"
-                + '", "filename":"'
-                + os.path.basename(value["file_name"])
-                + '", "total_size":"'
-                + f'{format_byte(value["total_size"])}'
-                + '" ,"download_progress":"'
-            )
-            result += (
-                f'{round(value["down_byte"] / value["total_size"] * 100, 1)}'
-                + '" ,"download_speed":"'
-                + download_speed
-                + '" ,"save_path":"'
-                + value["file_name"].replace("\\", "/")
-                + '"}'
+                '{ "chat":"' + f"{chat_id}" +
+                '", "id":"' + f"{msg_id}" +
+                '", "filename":"' + os.path.basename(info["file_name"]) +
+                '", "total_size":"' + format_byte(total_size) +
+                '" ,"download_progress":"' + f'{round(down_byte / total_size * 100, 1)}' +
+                '" ,"download_speed":"' + download_speed +
+                '" ,"save_path":"' + info["file_name"].replace("\\", "/") +
+                '"}'
             )
 
     result += "]"

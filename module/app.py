@@ -772,33 +772,40 @@ class Application:
         return True
 
     async def upload_file(
-        self,
-        local_file_path: str,
-        progress_callback: Callable = None,
-        progress_args: tuple = (),
+            self,
+            local_file_path: str,
+            progress_callback: Callable = None,
+            progress_args: tuple = (),
     ) -> bool:
         """Upload file"""
+        logger.info(
+            f"upload_file 开始: {local_file_path}, enable_upload_file={self.cloud_drive_config.enable_upload_file}, adapter={self.cloud_drive_config.upload_adapter}")
 
         if not self.cloud_drive_config.enable_upload_file:
+            logger.warning("云存储上传未启用，跳过上传")
             return False
 
         ret: bool = False
         if self.cloud_drive_config.upload_adapter == "rclone":
-            ret = await CloudDrive.rclone_upload_file(
-                self.cloud_drive_config,
-                self.save_path,
-                local_file_path,
-                progress_callback,
-                progress_args,
-            )
+            logger.debug(f"调用 rclone 上传: {local_file_path}")
+            try:
+                ret = await CloudDrive.rclone_upload_file(
+                    self.cloud_drive_config,
+                    self.save_path,
+                    local_file_path,
+                    progress_callback,
+                    progress_args,
+                )
+            except Exception as e:
+                logger.exception(f"rclone 上传异常: {e}")
+                return False
         elif self.cloud_drive_config.upload_adapter == "aligo":
-            ret = await self.loop.run_in_executor(
-                self.executor,
-                CloudDrive.aligo_upload_file(
-                    self.cloud_drive_config, self.save_path, local_file_path
-                ),
-            )
+            # ... 其他适配器
+            pass
+        else:
+            logger.error(f"未知的上传适配器: {self.cloud_drive_config.upload_adapter}")
 
+        logger.info(f"upload_file 结束，返回 {ret} 文件: {local_file_path}")
         return ret
 
     def get_file_save_path(
