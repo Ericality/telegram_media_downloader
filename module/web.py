@@ -7,6 +7,7 @@ import threading
 from flask import Flask, jsonify, render_template, request
 from flask_login import LoginManager, UserMixin, login_required, login_user
 
+import json
 import utils
 from module.app import Application
 from module.download_stat import (
@@ -180,13 +181,28 @@ def get_app_version():
 @_flask_app.route("/get_download_list")
 @login_required
 def get_download_list():
-    """get download list"""
-    if request.args.get("already_down") is None:
-        return "[]"
-
+    """返回当前活动下载任务列表（排除失败任务）"""
     already_down = request.args.get("already_down") == "true"
 
+    # 从 download_stat 获取所有任务的进度信息
     download_result = get_download_result()
+
+    # 加载所有失败任务 ID（用于过滤）
+    failed_task_ids = set()
+    try:
+        # 获取 app 实例（假设 app 是全局变量，或者通过其他方式导入）
+        # 这里假设 app 已经在模块中定义（如 from __main__ import app 或全局变量）
+        from __main__ import app
+        failed_tasks_file = os.path.join(app.session_file_path, "failed_tasks.json")
+        if os.path.exists(failed_tasks_file):
+            with open(failed_tasks_file, 'r', encoding='utf-8') as f:
+                all_failed = json.load(f)
+                for chat_key, tasks in all_failed.items():
+                    for task in tasks:
+                        failed_task_ids.add(f"{chat_key}:{task['message_id']}")
+    except Exception as e:
+        log.error(f"加载失败任务列表出错: {e}")
+
     result = "["
     for chat_id, messages in download_result.items():
         for msg_id, info in messages.items():
