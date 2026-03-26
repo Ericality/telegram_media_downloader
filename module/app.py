@@ -979,6 +979,10 @@ class Application:
                 with open(self.config_file, 'w', encoding='utf-8') as f:
                     yaml_writer.dump(current_config, f)
                 logger.success(f"✅ 配置更新成功，更新了 {len(new_chat_list)} 个聊天")
+
+                # 同步内存中的配置
+                self.config = current_config
+
                 self._clean_old_backups(backup_dir, base_name, keep=3)
                 return True
             except Exception as e:
