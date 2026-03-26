@@ -2125,10 +2125,9 @@ async def download_chat_task(
 
 async def download_all_chat(client: pyrogram.Client):
     """下载所有聊天 - 同时启动新消息生产者和重试生产者"""
-    # 第一步：为每个聊天创建 TaskNode（如果尚未创建）
+    # 第一步：为每个聊天强制创建正确的 TaskNode（覆盖默认的 chat_id=0）
     for chat_id, value in app.chat_download_config.items():
-        if value.node is None:
-            value.node = TaskNode(chat_id=chat_id)
+        value.node = TaskNode(chat_id=chat_id)   # 强制覆盖
 
     # 第二步：启动重试生产者（常驻）
     retry_tasks = []
@@ -2140,14 +2139,13 @@ async def download_all_chat(client: pyrogram.Client):
     # 第三步：启动新消息生产者（每个聊天一个，完成后会退出）
     new_msg_tasks = []
     for chat_id, value in app.chat_download_config.items():
-        # 传入显式的 chat_id 参数
+        # 传入显式的 chat_id 参数（沿用之前的修改）
         task = app.loop.create_task(download_chat_task(client, chat_id, value, value.node))
         new_msg_tasks.append(task)
 
     # 等待新消息生产者全部完成
     await asyncio.gather(*new_msg_tasks, return_exceptions=True)
 
-    # 新消息生产者完成后，不取消重试生产者，让它们继续运行
     logger.info("所有新消息生产者已完成，重试生产者将继续运行")
 
 async def retry_failed_tasks(
