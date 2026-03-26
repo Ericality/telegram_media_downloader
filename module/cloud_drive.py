@@ -85,7 +85,6 @@ class CloudDrive:
 
         return zip_file_name
 
-    # pylint: disable = R0914
     @staticmethod
     async def rclone_upload_file(
             drive_config: CloudDriveConfig,
@@ -94,7 +93,7 @@ class CloudDrive:
             progress_callback: Callable = None,
             progress_args: tuple = (),
     ) -> bool:
-        """Use Rclone upload file"""
+        """Use Rclone upload file (copy or move based on after_upload_file_delete)"""
         try:
             # 构建远程目录
             rel_path = os.path.dirname(local_file_path).replace(save_path, "").lstrip("/\\")
@@ -115,9 +114,10 @@ class CloudDrive:
                 file_to_upload = zip_file_path
                 logger.debug(f"已压缩文件: {zip_file_path}")
 
-            # 构建命令
+            # 根据配置选择 rclone 命令：move（上传后删除源文件）或 copy（保留源文件）
+            rclone_action = "move" if drive_config.after_upload_file_delete else "copy"
             cmd = (
-                f'"{drive_config.rclone_path}" copy "{file_to_upload}" '
+                f'"{drive_config.rclone_path}" {rclone_action} "{file_to_upload}" '
                 f'"{remote_dir}/" --create-empty-src-dirs --ignore-existing --progress'
             )
             logger.info(f"执行 rclone 命令: {cmd}")
@@ -133,35 +133,38 @@ class CloudDrive:
                     line = line_bytes.decode(errors="replace").rstrip()
                     logger.debug(f"rclone stdout: {line}")
 
-                    # 检测成功标志（更宽松的匹配）
+                    # 成功检测（匹配 copy 或 move 的输出）
                     if "100%" in line and ("1 / 1" in line or "(1/1)" in line):
                         logger.info(f"上传成功: {local_file_path} -> {remote_dir}")
                         drive_config.total_upload_success_file_count += 1
-                        # 删除本地文件
-                        if drive_config.after_upload_file_delete:
+
+                        # 如果使用 copy 且配置了上传后删除，需要手动删除
+                        if rclone_action == "copy" and drive_config.after_upload_file_delete:
                             try:
                                 os.remove(local_file_path)
                                 logger.info(f"已删除本地文件: {local_file_path}")
                             except Exception as e:
                                 logger.warning(f"删除本地文件失败: {e}")
+
+                        # 如果使用了压缩文件，且压缩文件不是原始文件，则需要删除压缩文件
                         if drive_config.before_upload_file_zip and zip_file_path:
                             try:
-                                os.remove(zip_file_path)
-                                logger.info(f"已删除压缩文件: {zip_file_path}")
+                                if os.path.exists(zip_file_path):
+                                    os.remove(zip_file_path)
+                                    logger.debug(f"已删除压缩文件: {zip_file_path}")
                             except Exception as e:
                                 logger.warning(f"删除压缩文件失败: {e}")
+
                         success = True
                     else:
-                        # 解析进度信息
+                        # 解析进度信息（可选）
                         pattern = r"Transferred: (.*?) / (.*?), (.*?)%, (.*?/s)?, ETA (.*?)$"
                         match = re.search(pattern, line)
                         if match:
                             if progress_callback:
-                                # 这里可以根据需要调用回调
                                 if inspect.iscoroutinefunction(progress_callback):
                                     await progress_callback(*progress_args)
                                 else:
-                                    # 同步回调使用线程池
                                     await asyncio.get_event_loop().run_in_executor(
                                         None, progress_callback, *progress_args
                                     )
@@ -176,8 +179,8 @@ class CloudDrive:
                 return True
             else:
                 logger.warning("未检测到上传成功标志，但进程已正常结束，可能上传已成功。请检查远程目录。")
-                # 可根据需要返回 True，或继续 False
-                return True  # 如果希望即使未检测到也认为成功，改为 True
+                # 即使未检测到标志，如果进程返回码为0，也可以认为成功
+                return returncode == 0
 
         except Exception as e:
             logger.exception(f"rclone_upload_file 异常: {e}")
