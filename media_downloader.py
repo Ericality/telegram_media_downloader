@@ -1509,6 +1509,7 @@ async def add_download_task(
                             if message_id_int > current_last_id:
                                 chat_config.last_read_message_id = message_id_int
                                 logger.debug(f"更新聊天 {node.chat_id} 的 last_read_message_id 到 {message_id_int}")
+                                asyncio.create_task(app.update_config(immediate=True))
                         except (ValueError, TypeError) as e:
                             logger.error(f"更新 last_read_message_id 时出错: {e}")
 

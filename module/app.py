@@ -917,18 +917,10 @@ class Application:
 
     # pylint: disable = R0912
     def update_config(self, immediate: bool = True):
-        import os
-        import shutil
-        import tempfile
-        import time
-        import glob
-        from ruamel.yaml import YAML
-        from loguru import logger
-
         try:
             logger.info("开始更新配置...")
 
-            # 1. 读取当前配置文件（如果存在）作为基础
+            # 读取当前配置
             current_config = {}
             yaml_loader = YAML(typ='safe')
             yaml_loader.allow_duplicate_keys = True
@@ -941,7 +933,7 @@ class Application:
             else:
                 logger.debug("配置文件不存在，将创建新配置")
 
-            # 2. 构建新的聊天配置列表
+            # 构建新的聊天配置列表
             new_chat_list = []
             for chat_id, chat_conf in self.chat_download_config.items():
                 new_chat_list.append({
@@ -949,14 +941,10 @@ class Application:
                     'last_read_message_id': chat_conf.last_read_message_id
                 })
 
-            # 3. 更新配置：保留其他所有部分，只替换 'chat' 部分
             current_config['chat'] = new_chat_list
-
-            # 4. 确保 language 等键只设置一次
             if hasattr(self, 'language'):
                 current_config['language'] = self.language.name
 
-            # 5. 清理旧版可能遗留的配置项
             old_keys = ["ids_to_retry", "chat_id", "download_filter"]
             for key in old_keys:
                 if key in current_config:
@@ -966,7 +954,7 @@ class Application:
                 logger.info(f"跳过写入配置，更新了 {len(new_chat_list)} 个聊天")
                 return len(new_chat_list) > 0
 
-            # 6. 备份原配置到持久化目录
+            # 备份原配置到持久化目录
             backup_dir = self.session_file_path
             os.makedirs(backup_dir, exist_ok=True)
             base_name = os.path.basename(self.config_file)
@@ -981,24 +969,38 @@ class Application:
             except Exception as e:
                 logger.error(f"备份配置文件失败: {e}，将尝试继续写入")
 
-            # 7. 写入临时文件并原子替换
+            # 使用 NamedTemporaryFile 创建临时文件，并重试替换
             dirname = os.path.dirname(self.config_file) or '.'
             os.makedirs(dirname, exist_ok=True)
-            fd, temp_path = tempfile.mkstemp(dir=dirname, prefix=os.path.basename(self.config_file) + '.tmp.')
+            temp_path = None
             try:
-                # 创建 YAML 写入实例
-                yaml_writer = YAML()
-                yaml_writer.allow_unicode = True
-                yaml_writer.sort_keys = False  # 保持键的顺序
-                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=dirname, delete=False,
+                                                 prefix=base_name + '.tmp.') as f:
+                    yaml_writer = YAML()
+                    yaml_writer.allow_unicode = True
+                    yaml_writer.sort_keys = False
                     yaml_writer.dump(current_config, f)
-                os.replace(temp_path, self.config_file)
+                    temp_path = f.name
+
+                # 尝试替换目标文件，重试3次，每次间隔0.5秒
+                for retry in range(3):
+                    try:
+                        os.replace(temp_path, self.config_file)
+                        break
+                    except OSError as e:
+                        if retry == 2:
+                            raise
+                        logger.warning(f"替换配置文件失败 (尝试 {retry + 1}/3): {e}，等待后重试")
+                        time.sleep(0.5)
+                else:
+                    raise Exception("替换配置文件失败")
+
                 logger.success(f"✅ 配置更新成功，更新了 {len(new_chat_list)} 个聊天")
                 self._clean_old_backups(backup_dir, base_name, keep=3)
                 return True
             except Exception as e:
                 logger.exception(f"写入配置文件失败: {e}")
-                if os.path.exists(temp_path):
+                if temp_path and os.path.exists(temp_path):
                     os.remove(temp_path)
                 return False
 
