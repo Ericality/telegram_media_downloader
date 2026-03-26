@@ -93,7 +93,7 @@ class CloudDrive:
             progress_callback: Callable = None,
             progress_args: tuple = (),
     ) -> bool:
-        """Use Rclone upload file (copy or move based on after_upload_file_delete)"""
+        """Use Rclone upload file (copy or move)"""
         try:
             # 构建远程目录
             rel_path = os.path.dirname(local_file_path).replace(save_path, "").lstrip("/\\")
@@ -106,7 +106,7 @@ class CloudDrive:
                 CloudDrive.rclone_mkdir(drive_config, remote_dir)
                 drive_config.dir_cache[remote_dir] = True
 
-            # 处理压缩选项
+            # 处理压缩
             zip_file_path = ""
             file_to_upload = local_file_path
             if drive_config.before_upload_file_zip:
@@ -114,7 +114,7 @@ class CloudDrive:
                 file_to_upload = zip_file_path
                 logger.debug(f"已压缩文件: {zip_file_path}")
 
-            # 根据配置选择 rclone 命令：move（上传后删除源文件）或 copy（保留源文件）
+            # 选择命令
             rclone_action = "move" if drive_config.after_upload_file_delete else "copy"
             cmd = (
                 f'"{drive_config.rclone_path}" {rclone_action} "{file_to_upload}" '
@@ -122,65 +122,78 @@ class CloudDrive:
             )
             logger.info(f"执行 rclone 命令: {cmd}")
 
-            # 执行命令
             proc = await asyncio.create_subprocess_shell(
-                cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+                cmd, shell=True, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
             )
 
             success = False
+            stdout_lines = []
             if proc.stdout:
                 async for line_bytes in proc.stdout:
                     line = line_bytes.decode(errors="replace").rstrip()
                     logger.debug(f"rclone stdout: {line}")
+                    stdout_lines.append(line)
 
-                    # 成功检测（匹配 copy 或 move 的输出）
-                    if "100%" in line and ("1 / 1" in line or "(1/1)" in line):
-                        logger.info(f"上传成功: {local_file_path} -> {remote_dir}")
-                        drive_config.total_upload_success_file_count += 1
-
-                        # 如果使用 copy 且配置了上传后删除，需要手动删除
-                        if rclone_action == "copy" and drive_config.after_upload_file_delete:
-                            try:
-                                os.remove(local_file_path)
-                                logger.info(f"已删除本地文件: {local_file_path}")
-                            except Exception as e:
-                                logger.warning(f"删除本地文件失败: {e}")
-
-                        # 如果使用了压缩文件，且压缩文件不是原始文件，则需要删除压缩文件
-                        if drive_config.before_upload_file_zip and zip_file_path:
-                            try:
-                                if os.path.exists(zip_file_path):
-                                    os.remove(zip_file_path)
-                                    logger.debug(f"已删除压缩文件: {zip_file_path}")
-                            except Exception as e:
-                                logger.warning(f"删除压缩文件失败: {e}")
-
+                    # 检测成功标志：只要出现 100% 即可
+                    if "100%" in line:
                         success = True
-                    else:
-                        # 解析进度信息（可选）
-                        pattern = r"Transferred: (.*?) / (.*?), (.*?)%, (.*?/s)?, ETA (.*?)$"
-                        match = re.search(pattern, line)
-                        if match:
-                            if progress_callback:
-                                if inspect.iscoroutinefunction(progress_callback):
-                                    await progress_callback(*progress_args)
-                                else:
-                                    await asyncio.get_event_loop().run_in_executor(
-                                        None, progress_callback, *progress_args
-                                    )
+
+                    # 解析进度（如果需要回调）
+                    pattern = r"Transferred: (.*?) / (.*?), (.*?)%, (.*?/s)?, ETA (.*?)$"
+                    match = re.search(pattern, line)
+                    if match:
+                        if progress_callback:
+                            if inspect.iscoroutinefunction(progress_callback):
+                                await progress_callback(*progress_args)
+                            else:
+                                await asyncio.get_event_loop().run_in_executor(
+                                    None, progress_callback, *progress_args
+                                )
 
             # 等待进程结束
             returncode = await proc.wait()
             if returncode != 0:
-                logger.error(f"rclone 进程退出码: {returncode}")
+                stderr = (await proc.stderr.read()).decode(errors="replace") if proc.stderr else ""
+                logger.error(f"rclone 进程退出码: {returncode}, stderr: {stderr}")
                 return False
 
-            if success:
-                return True
-            else:
-                logger.warning("未检测到上传成功标志，但进程已正常结束，可能上传已成功。请检查远程目录。")
-                # 即使未检测到标志，如果进程返回码为0，也可以认为成功
-                return returncode == 0
+            # 如果未检测到成功标志，但进程正常结束，仍视为成功（可能因文件已存在被跳过）
+            if not success:
+                logger.warning("未检测到 100% 进度，但进程已正常结束。如果使用了 move，文件可能已被删除。")
+
+            # 处理成功后清理
+            if drive_config.after_upload_file_delete and rclone_action == "move":
+                # 如果使用 move，rclone 应该已经删除源文件，但为了保险，检查并尝试删除
+                if os.path.exists(local_file_path):
+                    logger.warning(f"move 后本地文件仍存在，尝试手动删除: {local_file_path}")
+                    try:
+                        os.remove(local_file_path)
+                        logger.info(f"手动删除本地文件: {local_file_path}")
+                    except Exception as e:
+                        logger.error(f"手动删除失败: {e}")
+                else:
+                    logger.debug(f"文件已被 rclone move 删除: {local_file_path}")
+            elif drive_config.after_upload_file_delete and rclone_action == "copy":
+                # 如果使用 copy 且配置删除，手动删除
+                try:
+                    os.remove(local_file_path)
+                    logger.info(f"已删除本地文件: {local_file_path}")
+                except Exception as e:
+                    logger.warning(f"删除本地文件失败: {e}")
+
+            # 删除压缩文件
+            if drive_config.before_upload_file_zip and zip_file_path and os.path.exists(zip_file_path):
+                try:
+                    os.remove(zip_file_path)
+                    logger.debug(f"已删除压缩文件: {zip_file_path}")
+                except Exception as e:
+                    logger.warning(f"删除压缩文件失败: {e}")
+
+            # 更新统计
+            drive_config.total_upload_success_file_count += 1
+            logger.info(f"上传成功: {local_file_path} -> {remote_dir}")
+
+            return True
 
         except Exception as e:
             logger.exception(f"rclone_upload_file 异常: {e}")
