@@ -182,16 +182,22 @@ def get_app_version():
 @login_required
 def get_download_list():
     """返回当前活动下载任务列表（排除失败任务）"""
+    import os
+    import json
+    from loguru import logger
+    from module.download_stat import get_download_result
+    from utils.format import format_byte
+
     already_down = request.args.get("already_down") == "true"
 
-    # 从 download_stat 获取所有任务的进度信息
+    # 1. 获取所有任务进度
     download_result = get_download_result()
+    logger.debug(f"download_result 原始内容: {download_result}")
 
-    # 加载所有失败任务 ID（用于过滤）
+    # 2. 加载失败任务 ID 集合
     failed_task_ids = set()
     try:
-        # 获取 app 实例（假设 app 是全局变量，或者通过其他方式导入）
-        # 这里假设 app 已经在模块中定义（如 from __main__ import app 或全局变量）
+        # 尝试从全局 app 获取路径（如果 web 模块中已有 app 变量，可直接使用）
         from __main__ import app
         failed_tasks_file = os.path.join(app.session_file_path, "failed_tasks.json")
         if os.path.exists(failed_tasks_file):
@@ -200,41 +206,49 @@ def get_download_list():
                 for chat_key, tasks in all_failed.items():
                     for task in tasks:
                         failed_task_ids.add(f"{chat_key}:{task['message_id']}")
+        logger.debug(f"加载失败任务 ID 集合，共 {len(failed_task_ids)} 个")
     except Exception as e:
-        log.error(f"加载失败任务列表出错: {e}")
+        logger.error(f"加载失败任务列表出错: {e}")
 
-    result = "["
+    # 3. 构建结果 JSON
+    result_parts = []
     for chat_id, messages in download_result.items():
         for msg_id, info in messages.items():
             total_size = info["total_size"]
             down_byte = info["down_byte"]
             is_completed = (down_byte == total_size)
 
-            # 根据 already_down 参数决定显示已完成的还是未完成的
+            # 根据参数决定显示已完成还是未完成
             if already_down and not is_completed:
+                logger.debug(f"跳过未完成消息 {msg_id} (already_down=true)")
                 continue
             if not already_down and is_completed:
+                logger.debug(f"跳过已完成消息 {msg_id} (already_down=false)")
                 continue
 
-            # 如果是未完成的任务，且该任务在失败列表中，则跳过（不显示）
+            # 未完成任务且是失败任务，则跳过
             if not already_down:
                 task_key = f"{chat_id}:{msg_id}"
                 if task_key in failed_task_ids:
+                    logger.debug(f"跳过失败任务 {task_key} (在失败列表中)")
                     continue
 
-            if result != "[":
-                result += ","
+            # 构造单个任务 JSON
             download_speed = format_byte(info["download_speed"]) + "/s"
-            result += (
+            progress = round(down_byte / total_size * 100, 1) if total_size > 0 else 0
+            task_json = (
                 '{ "chat":"' + f"{chat_id}" +
                 '", "id":"' + f"{msg_id}" +
                 '", "filename":"' + os.path.basename(info["file_name"]) +
                 '", "total_size":"' + format_byte(total_size) +
-                '" ,"download_progress":"' + f'{round(down_byte / total_size * 100, 1)}' +
+                '" ,"download_progress":"' + f"{progress}" +
                 '" ,"download_speed":"' + download_speed +
                 '" ,"save_path":"' + info["file_name"].replace("\\", "/") +
                 '"}'
             )
+            result_parts.append(task_json)
+            logger.debug(f"添加任务: chat={chat_id}, msg={msg_id}, progress={progress}%")
 
-    result += "]"
+    result = "[" + ",".join(result_parts) + "]"
+    logger.debug(f"最终返回结果长度: {len(result)}，包含 {len(result_parts)} 个任务")
     return result
