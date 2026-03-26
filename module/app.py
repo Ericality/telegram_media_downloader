@@ -18,8 +18,10 @@ from module.language import Language, set_language
 from utils.format import replace_date_time, validate_title
 from utils.meta_data import MetaData
 
+import os
+import glob
+
 import shutil
-import json
 
 _yaml = yaml.YAML()
 # pylint: disable = R0902
@@ -772,40 +774,33 @@ class Application:
         return True
 
     async def upload_file(
-            self,
-            local_file_path: str,
-            progress_callback: Callable = None,
-            progress_args: tuple = (),
+        self,
+        local_file_path: str,
+        progress_callback: Callable = None,
+        progress_args: tuple = (),
     ) -> bool:
         """Upload file"""
-        logger.info(
-            f"upload_file 开始: {local_file_path}, enable_upload_file={self.cloud_drive_config.enable_upload_file}, adapter={self.cloud_drive_config.upload_adapter}")
 
         if not self.cloud_drive_config.enable_upload_file:
-            logger.warning("云存储上传未启用，跳过上传")
             return False
 
         ret: bool = False
         if self.cloud_drive_config.upload_adapter == "rclone":
-            logger.debug(f"调用 rclone 上传: {local_file_path}")
-            try:
-                ret = await CloudDrive.rclone_upload_file(
-                    self.cloud_drive_config,
-                    self.save_path,
-                    local_file_path,
-                    progress_callback,
-                    progress_args,
-                )
-            except Exception as e:
-                logger.exception(f"rclone 上传异常: {e}")
-                return False
+            ret = await CloudDrive.rclone_upload_file(
+                self.cloud_drive_config,
+                self.save_path,
+                local_file_path,
+                progress_callback,
+                progress_args,
+            )
         elif self.cloud_drive_config.upload_adapter == "aligo":
-            # ... 其他适配器
-            pass
-        else:
-            logger.error(f"未知的上传适配器: {self.cloud_drive_config.upload_adapter}")
+            ret = await self.loop.run_in_executor(
+                self.executor,
+                CloudDrive.aligo_upload_file(
+                    self.cloud_drive_config, self.save_path, local_file_path
+                ),
+            )
 
-        logger.info(f"upload_file 结束，返回 {ret} 文件: {local_file_path}")
         return ret
 
     def get_file_save_path(
@@ -920,12 +915,156 @@ class Application:
         return True
 
     # pylint: disable = R0912
+    def update_config(self, immediate: bool = True):
+        """更新配置 - 修复 chat_id 类型匹配问题"""
+        try:
+            logger.info(f"开始更新配置...")
+
+            # 确保 app_data 中有 chat 配置
+            if not self.app_data.get("chat") and self.config.get("chat"):
+                self.app_data["chat"] = [
+                    {"chat_id": i} for i in range(0, len(self.config["chat"]))
+                ]
+
+            # 创建 chat_id 到索引的映射（支持整数和字符串类型）
+            chat_id_to_idx = {}
+            for idx, chat_item in enumerate(self.config.get("chat", [])):
+                chat_id = chat_item.get("chat_id")
+                if chat_id is not None:
+                    # 将 chat_id 转换为字符串以便比较
+                    chat_id_str = str(chat_id)
+                    chat_id_to_idx[chat_id_str] = idx
+                    # 同时存储整数版本（如果可能）
+                    try:
+                        chat_id_int = int(chat_id)
+                        chat_id_to_idx[chat_id_int] = idx
+                    except (ValueError, TypeError):
+                        pass
+
+            # 遍历聊天配置，更新 last_read_message_id
+            updated_chats = 0
+            for chat_id, chat_config in self.chat_download_config.items():
+                # 尝试多种方式查找索引
+                idx = -1
+
+                # 1. 尝试直接匹配（原始类型）
+                idx = chat_id_to_idx.get(chat_id, -1)
+
+                # 2. 尝试字符串匹配
+                if idx == -1:
+                    idx = chat_id_to_idx.get(str(chat_id), -1)
+
+                # 3. 尝试整数匹配（如果可能）
+                if idx == -1:
+                    try:
+                        chat_id_int = int(chat_id)
+                        idx = chat_id_to_idx.get(chat_id_int, -1)
+                    except (ValueError, TypeError):
+                        pass
+
+                # 如果不存在于原始配置中，记录详细日志
+                if idx == -1:
+                    logger.warning(f"聊天 {chat_id} (类型: {type(chat_id)}) 不在原始配置中，跳过更新")
+                    logger.debug(f"可用的配置聊天ID: {list(chat_id_to_idx.keys())}")
+                    logger.debug(f"当前聊天配置ID: {list(self.chat_download_config.keys())}")
+                    continue
+
+                # 确保 app_data 有足够的项目
+                while idx >= len(self.app_data["chat"]):
+                    self.app_data["chat"].append({})
+
+                # 更新 app_data
+                self.app_data["chat"][idx]["chat_id"] = str(chat_id)  # 统一存储为字符串
+
+                # 更新配置中的 last_read_message_id
+                if hasattr(chat_config, 'last_read_message_id') and chat_config.last_read_message_id is not None:
+                    try:
+                        current_last_id = self.config["chat"][idx].get("last_read_message_id", 0)
+                        new_last_id = int(chat_config.last_read_message_id)
+                        current_last_id = int(current_last_id)
+
+                        # 只向前更新，不后退
+                        if new_last_id > current_last_id:
+                            self.config["chat"][idx]["last_read_message_id"] = new_last_id
+                            logger.info(
+                                f"✅ 更新聊天 {chat_id} 的 last_read_message_id: {current_last_id} -> {new_last_id}")
+                            updated_chats += 1
+                        elif new_last_id == current_last_id:
+                            logger.debug(f"聊天 {chat_id} 的 last_read_message_id 未变化: {current_last_id}")
+                        else:
+                            logger.warning(
+                                f"聊天 {chat_id} 的 last_read_message_id 倒退了: 当前={current_last_id}, 新={new_last_id}")
+                    except (ValueError, TypeError) as e:
+                        logger.error(
+                            f"处理聊天 {chat_id} 的 last_read_message_id 时出错: {e}, 值={chat_config.last_read_message_id}")
+                else:
+                    logger.debug(f"聊天 {chat_id} 没有 last_read_message_id 属性或值为 None")
+
+            # 如果没有更新任何聊天，记录日志
+            if updated_chats == 0:
+                logger.warning("没有找到需要更新的聊天配置")
+                logger.debug(f"当前聊天配置数量: {len(self.chat_download_config)}")
+                logger.debug(f"配置文件中聊天数量: {len(self.config.get('chat', []))}")
+
+            # 清理旧版配置项
+            old_keys = ["ids_to_retry", "chat_id", "download_filter"]
+            for key in old_keys:
+                if key in self.config:
+                    self.config.pop(key)
+
+            # 更新语言配置
+            if hasattr(self, 'language'):
+                self.config["language"] = self.language.name
+
+            # 立即写入配置
+            if immediate:
+                try:
+                    # 备份原始配置以防万一
+                    config_backup = f"{self.config_file}.backup.{int(time.time())}"
+                    if os.path.exists(self.config_file):
+                        # 创建备份目录
+                        backup_dir = os.path.dirname(config_backup)
+                        if backup_dir and not os.path.exists(backup_dir):
+                            os.makedirs(backup_dir, exist_ok=True)
+
+                        shutil.copy2(self.config_file, config_backup)
+                        logger.info(f"已备份配置到: {config_backup}")
+
+                    # 写入新配置
+                    with open(self.config_file, "w", encoding="utf-8") as yaml_file:
+                        _yaml.dump(self.config, yaml_file)
+                    logger.success(f"✅ 配置更新成功，更新了 {updated_chats} 个聊天")
+
+                    # 写入应用数据
+                    if self.app_data_file:
+                        with open(self.app_data_file, "w", encoding='utf-8') as yaml_file:
+                            _yaml.dump(self.app_data, yaml_file)
+                        logger.debug("应用数据更新成功")
+
+                    return True
+
+                except Exception as e:
+                    logger.error(f"❌ 写入配置文件失败: {e}")
+                    import traceback
+                    logger.error(f"堆栈信息: {traceback.format_exc()}")
+                    return False
+            else:
+                logger.info(f"跳过写入配置，更新了 {updated_chats} 个聊天")
+                return updated_chats > 0
+
+        except Exception as e:
+            logger.error(f"❌ 更新配置失败: {e}")
+            import traceback
+            logger.error(f"堆栈信息: {traceback.format_exc()}")
+            return False
+
+    def set_language(self, language: Language):
+        """Set Language"""
+        self.language = language
+        set_language(language)
+
     def load_config(self) -> bool:
         """加载配置，失败时尝试从备份恢复"""
-        import yaml
-        import shutil
-        import os
-        import glob
 
         config_path = self.config_file
 
@@ -973,31 +1112,6 @@ class Application:
                 except Exception as restore_err:
                     logger.error(f"从备份恢复失败: {restore_err}")
             return False
-
-    def set_language(self, language: Language):
-        """Set Language"""
-        self.language = language
-        set_language(language)
-
-    def load_config(self):
-        """Load user config"""
-        with open(
-            os.path.join(os.path.abspath("."), self.config_file), encoding="utf-8"
-        ) as f:
-            config = _yaml.load(f.read())
-            if config:
-                self.config = config
-                self.assign_config(self.config)
-
-        if os.path.exists(os.path.join(os.path.abspath("."), self.app_data_file)):
-            with open(
-                os.path.join(os.path.abspath("."), self.app_data_file),
-                encoding="utf-8",
-            ) as f:
-                app_data = _yaml.load(f.read())
-                if app_data:
-                    self.app_data = app_data
-                    self.assign_app_data(self.app_data)
 
     def pre_run(self):
         """before run application do"""
