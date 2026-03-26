@@ -474,6 +474,7 @@ class Application:
             Application Name
 
         """
+        self._config_lock = asyncio.Lock()
         self.config_file: str = config_file
         self.app_data_file: str = app_data_file
         self.application_name: str = application_name
@@ -920,7 +921,7 @@ class Application:
         try:
             logger.info("开始更新配置...")
 
-            # 读取当前配置
+            # 读取当前配置作为基础
             current_config = {}
             yaml_loader = YAML(typ='safe')
             yaml_loader.allow_duplicate_keys = True
@@ -945,6 +946,7 @@ class Application:
             if hasattr(self, 'language'):
                 current_config['language'] = self.language.name
 
+            # 清理旧版字段
             old_keys = ["ids_to_retry", "chat_id", "download_filter"]
             for key in old_keys:
                 if key in current_config:
@@ -969,39 +971,25 @@ class Application:
             except Exception as e:
                 logger.error(f"备份配置文件失败: {e}，将尝试继续写入")
 
-            # 使用 NamedTemporaryFile 创建临时文件，并重试替换
-            dirname = os.path.dirname(self.config_file) or '.'
-            os.makedirs(dirname, exist_ok=True)
-            temp_path = None
+            # 直接写入原文件（覆盖）
             try:
-                with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=dirname, delete=False,
-                                                 prefix=base_name + '.tmp.') as f:
-                    yaml_writer = YAML()
-                    yaml_writer.allow_unicode = True
-                    yaml_writer.sort_keys = False
+                yaml_writer = YAML()
+                yaml_writer.allow_unicode = True
+                yaml_writer.sort_keys = False
+                with open(self.config_file, 'w', encoding='utf-8') as f:
                     yaml_writer.dump(current_config, f)
-                    temp_path = f.name
-
-                # 尝试替换目标文件，重试3次，每次间隔0.5秒
-                for retry in range(3):
-                    try:
-                        os.replace(temp_path, self.config_file)
-                        break
-                    except OSError as e:
-                        if retry == 2:
-                            raise
-                        logger.warning(f"替换配置文件失败 (尝试 {retry + 1}/3): {e}，等待后重试")
-                        time.sleep(0.5)
-                else:
-                    raise Exception("替换配置文件失败")
-
                 logger.success(f"✅ 配置更新成功，更新了 {len(new_chat_list)} 个聊天")
                 self._clean_old_backups(backup_dir, base_name, keep=3)
                 return True
             except Exception as e:
                 logger.exception(f"写入配置文件失败: {e}")
-                if temp_path and os.path.exists(temp_path):
-                    os.remove(temp_path)
+                # 尝试恢复备份
+                if os.path.exists(backup_path):
+                    try:
+                        shutil.copy2(backup_path, self.config_file)
+                        logger.info(f"已从备份恢复配置文件: {backup_path}")
+                    except Exception as restore_err:
+                        logger.error(f"恢复备份失败: {restore_err}")
                 return False
 
         except Exception as e:
