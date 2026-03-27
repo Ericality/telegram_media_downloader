@@ -151,16 +151,16 @@ class CloudDrive:
                             speed = "0 B/s"
                         logger.debug(f"进度: {percent}%, 速度: {speed}, 剩余: {eta}")
 
-                        # 调用回调（如果提供）
+                        # 调用回调（如果提供）—— 只传递核心参数，忽略 speed 和 eta
                         if progress_callback and progress_args:
                             # progress_args 应该是 (node, message_id, file_name)
                             if len(progress_args) >= 3:
                                 node, msg_id, fname = progress_args[0], progress_args[1], progress_args[2]
                                 if inspect.iscoroutinefunction(progress_callback):
-                                    await progress_callback(speed, eta, node, msg_id, fname)
+                                    await progress_callback(node, msg_id, fname)
                                 else:
                                     await asyncio.get_event_loop().run_in_executor(
-                                        None, progress_callback, speed, eta, node, msg_id, fname
+                                        None, progress_callback, node, msg_id, fname
                                     )
                             else:
                                 logger.warning(f"progress_args 长度不足: {len(progress_args)}, 期望至少3个")
