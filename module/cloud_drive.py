@@ -143,7 +143,6 @@ class CloudDrive:
                         success = True
 
                     # 解析进度信息
-                    # 格式示例: "Transferred: 1.234MiB / 5.678MiB, 21%, 1.2MiB/s, ETA 0s"
                     pattern = r"Transferred: (.*?) / (.*?), (.*?)%, (.*?/s)?, ETA (.*?)$"
                     match = re.search(pattern, line)
                     if match:
@@ -154,9 +153,7 @@ class CloudDrive:
 
                         # 调用回调（如果提供）
                         if progress_callback and progress_args:
-                            # progress_args 应该包含 (node, message_id, file_name)
-                            # 根据错误日志，update_cloud_upload_stat 需要 speed, eta, node, message_id, file_name
-                            # 所以我们构造参数
+                            # progress_args 应该是 (node, message_id, file_name)
                             if len(progress_args) >= 3:
                                 node, msg_id, fname = progress_args[0], progress_args[1], progress_args[2]
                                 if inspect.iscoroutinefunction(progress_callback):
