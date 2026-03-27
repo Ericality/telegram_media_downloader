@@ -151,16 +151,17 @@ class CloudDrive:
                             speed = "0 B/s"
                         logger.debug(f"进度: {percent}%, 速度: {speed}, 剩余: {eta}")
 
-                        # 调用回调（如果提供）—— 只传递核心参数，忽略 speed 和 eta
+                        # 调用回调（如果提供），传递全部8个参数
                         if progress_callback and progress_args:
-                            # progress_args 应该是 (node, message_id, file_name)
                             if len(progress_args) >= 3:
                                 node, msg_id, fname = progress_args[0], progress_args[1], progress_args[2]
                                 if inspect.iscoroutinefunction(progress_callback):
-                                    await progress_callback(node, msg_id, fname)
+                                    await progress_callback(transferred, total, percent, speed, eta, node, msg_id,
+                                                            fname)
                                 else:
                                     await asyncio.get_event_loop().run_in_executor(
-                                        None, progress_callback, node, msg_id, fname
+                                        None, progress_callback, transferred, total, percent, speed, eta, node, msg_id,
+                                        fname
                                     )
                             else:
                                 logger.warning(f"progress_args 长度不足: {len(progress_args)}, 期望至少3个")
@@ -174,7 +175,6 @@ class CloudDrive:
 
             # 如果未检测到成功标志，但进程正常结束，尝试判断是否成功
             if not success:
-                # 如果命令是 move，并且文件已不存在，则认为成功
                 if rclone_action == "move" and not os.path.exists(file_to_upload):
                     logger.info("使用 move 且源文件已不存在，认为上传成功")
                     success = True
@@ -187,7 +187,6 @@ class CloudDrive:
 
             # 处理成功后清理
             if success:
-                # 更新统计
                 drive_config.total_upload_success_file_count += 1
                 logger.info(f"上传成功: {local_file_path} -> {remote_dir}")
 
@@ -200,7 +199,6 @@ class CloudDrive:
                             logger.info(f"手动删除本地文件: {file_to_upload}")
                         except Exception as e:
                             logger.error(f"手动删除失败: {e}")
-                # 如果使用 copy 且配置删除，手动删除
                 elif drive_config.after_upload_file_delete:
                     try:
                         os.remove(file_to_upload)
@@ -208,7 +206,7 @@ class CloudDrive:
                     except Exception as e:
                         logger.warning(f"删除本地文件失败: {e}")
 
-                # 删除压缩文件（如果存在）
+                # 删除压缩文件
                 if drive_config.before_upload_file_zip and zip_file_path and os.path.exists(zip_file_path):
                     try:
                         os.remove(zip_file_path)
