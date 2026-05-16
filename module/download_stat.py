@@ -32,6 +32,8 @@ def get_download_result() -> dict:
 
 def get_total_download_speed() -> int:
     """get total download speed"""
+    if time.time() - _last_download_time > 2:  # 2秒无更新视为无下载
+        return 0
     return _total_download_speed
 
 
