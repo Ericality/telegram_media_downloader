@@ -1,4 +1,8 @@
-"""Application module"""
+"""Application module - config loading & persistence
+
+Handles YAML config parsing, schema validation, legacy config migration,
+chat download configuration, and file path generation.
+"""
 
 import asyncio
 import os
@@ -344,11 +348,14 @@ def get_config(config, key, default=None, val_type=str, verbose=True):
 
 
 class ConfigSchema:
-    """配置架构定义，描述每个配置项的默认值、类型和转换函数"""
+    """Config schema definition
 
-    # 基础配置架构
+    Defines defaults, types, and converters for all config keys.
+    """
+
+    # Base config schema
     BASE_CONFIG = {
-        # 键名: (默认值, 类型, 转换函数或None)
+        # Key: (default, type, converter or None)
         "api_id": (0, int, None),
         "api_hash": ("", str, None),
         "bot_token": ("", str, None),
@@ -381,11 +388,11 @@ class ConfigSchema:
         "forward_limit": (33, int, None),
     }
 
-    # 新增：通知配置架构
+    # Notification config schema
     NOTIFICATION_CONFIG = {
-        # 键名: (默认值, 类型, 转换函数或None)
+        # Key: (default, type, converter or None)
         "notifications": ({
-                              # Bark 配置
+                              # Bark config
                               "bark": {
                                   "enabled": False,
                                   "url": "",
@@ -397,7 +404,7 @@ class ConfigSchema:
                                   "stats_notification_interval": 3600,
                                   "notify_worker_count": 1
                               },
-                              # 群晖 Chat 配置
+                              # Synology Chat config
                               "synology_chat": {
                                   "enabled": False,
                                   "webhook_url": "",
@@ -410,7 +417,7 @@ class ConfigSchema:
                                   "disk_space_threshold_gb": 10.0,
                                   "space_check_interval": 300
                               },
-                              # 全局配置
+                              # Global config
                               "global": {
                                   "stats_notification_interval": 3600,
                                   "queue_monitor_interval": 300,
@@ -422,12 +429,12 @@ class ConfigSchema:
 
     @classmethod
     def get_all_configs(cls):
-        """获取所有配置项"""
+        """Get all config item definitions."""
         return {**cls.BASE_CONFIG, **cls.NOTIFICATION_CONFIG}
 
     @classmethod
     def get_default(cls, key):
-        """获取配置项的默认值"""
+        """Get default value for a config key."""
         all_configs = cls.get_all_configs()
         if key in all_configs:
             return all_configs[key][0]
@@ -435,7 +442,7 @@ class ConfigSchema:
 
     @classmethod
     def get_type(cls, key):
-        """获取配置项的类型"""
+        """Get expected type for a config key."""
         all_configs = cls.get_all_configs()
         if key in all_configs:
             return all_configs[key][1]
@@ -443,7 +450,7 @@ class ConfigSchema:
 
     @classmethod
     def get_converter(cls, key):
-        """获取配置项的转换函数"""
+        """Get converter function for a config key."""
         all_configs = cls.get_all_configs()
         if key in all_configs:
             return all_configs[key][2]
@@ -489,7 +496,7 @@ class Application:
         self.caption_name_dict: dict = {}
         self.caption_entities_dict: dict = {}
 
-        # 使用配置架构初始化所有配置项
+        # Initialize all config items from schema
         self._init_config_from_schema()
 
         self.forward_limit_call = LimitCall(max_limit_call_times=self.forward_limit)
@@ -502,26 +509,26 @@ class Application:
         )
 
     def _init_config_from_schema(self):
-        """根据配置架构初始化所有配置项"""
+        """Initialize all config items from schema."""
         for key, (default_value, value_type, converter) in ConfigSchema.get_all_configs().items():
             setattr(self, key, default_value)
 
     def _load_and_convert_value(self, key: str, raw_value: Any) -> Any:
-        """加载并转换配置值"""
+        """Load and convert a config value."""
         try:
             converter = ConfigSchema.get_converter(key)
             expected_type = ConfigSchema.get_type(key)
 
             if converter:
-                # 使用转换函数
+                # Use converter function
                 converted_value = converter(raw_value)
             else:
-                # 直接赋值，但检查类型
+                # Direct assignment with type check
                 converted_value = raw_value
 
-            # 类型检查 - 更灵活的处理
+            # Type check with flexible coercion
             if expected_type and not isinstance(converted_value, expected_type):
-                # 尝试自动类型转换
+                    # Try automatic type coercion
                 try:
                     if expected_type == bool:
                         if isinstance(converted_value, str):
@@ -537,12 +544,12 @@ class Application:
                     elif expected_type == list and isinstance(converted_value, (tuple, set)):
                         converted_value = list(converted_value)
                     else:
-                        # 转换失败，使用默认值
+                        # Coercion failed, use default
                         default_value = ConfigSchema.get_default(key)
                         logger.warning(f"配置项 {key} 类型转换失败，使用默认值: {default_value}")
                         converted_value = default_value
                 except (ValueError, TypeError) as e:
-                    # 转换失败，使用默认值
+                    # Coercion failed, use default
                     default_value = ConfigSchema.get_default(key)
                     logger.warning(f"配置项 {key} 类型转换失败 ({e})，使用默认值: {default_value}")
                     converted_value = default_value
@@ -564,36 +571,36 @@ class Application:
         -------
         bool
         """
-        # 处理特殊配置项（需要复杂逻辑的）
+        # Handle special config items (complex logic)
         self._process_special_configs(_config)
 
-        # 处理通知配置（必须放在通用配置之前，因为它会修改 _config）
+        # Process notifications before general configs (may modify _config)
         self._process_notifications_config(_config)
 
-        # 处理通用配置项
+        # Process general config items
         self._process_general_configs(_config)
 
-        # 新增：处理未在架构中定义的配置项
+        # Handle config keys not in schema
         known_keys = set(ConfigSchema.BASE_CONFIG.keys()) | set(ConfigSchema.NOTIFICATION_CONFIG.keys())
         for key, value in _config.items():
             if key not in known_keys and not hasattr(self, key):
-                # 对于未知配置项，直接设置为属性
+                # Set unknown keys as attributes directly
                 setattr(self, key, value)
                 logger.debug(f"加载未声明配置项 {key}: {value}")
 
-        # 处理聊天配置
+        # Process chat configurations
         self._process_chat_configs(_config)
 
-        # 处理云存储配置
+        # Process cloud drive config
         self._process_cloud_drive_config(_config)
 
-        # 处理日期格式
+        # Validate date format
         self._validate_date_format()
 
-        # 处理聊天配置的过滤器
+        # Process chat filters
         self._process_chat_filters()
 
-        # 立即设置日志级别（确保立即生效）
+        # Apply log level immediately
         if hasattr(self, 'log_level'):
             import logging
             log_level = self.log_level.upper()
@@ -608,27 +615,27 @@ class Application:
         return True
 
     def _process_special_configs(self, _config: dict):
-        """处理需要特殊逻辑的配置项"""
-        # 从配置中提取特殊的配置项并设置
+        """Process config items requiring special logic"""
+        # Extract and set special config items
         if "save_path" in _config:
             self.save_path = _config["save_path"]
 
-        # 媒体类型和文件格式是必须的
+        # Media types and file formats are mandatory
         if "media_types" in _config:
             self.media_types = _config["media_types"]
         if "file_formats" in _config:
             self.file_formats = _config["file_formats"]
 
     def _process_general_configs(self, _config: dict):
-        """处理通用配置项"""
-        # 遍历配置架构中的所有键
+        """Process general config items"""
+        # Iterate over all keys in config schema
         for key in ConfigSchema.BASE_CONFIG.keys():
             if key in _config:
                 raw_value = _config[key]
                 converted_value = self._load_and_convert_value(key, raw_value)
                 setattr(self, key, converted_value)
 
-                # 记录日志（可选）
+                # Log value (mask credentials)
                 if key in ['api_id', 'api_hash', 'bot_token', 'web_login_secret']:
                     masked_value = '****' if raw_value else ''
                     logger.debug(f"加载配置 {key}: {masked_value}")
@@ -636,7 +643,7 @@ class Application:
                     logger.debug(f"加载配置 {key}: {raw_value}")
 
     def _process_chat_configs(self, _config: dict):
-        """处理聊天配置"""
+        """Process chat configs"""
         if "chat" in _config:
             chat = _config["chat"]
             for item in chat:
@@ -654,7 +661,7 @@ class Application:
                         "upload_telegram_chat_id", None
                     )
         elif "chat_id" in _config:
-            # 兼容旧版本
+            # Legacy format compatibility
             self._chat_id = _config["chat_id"]
             self.chat_download_config[self._chat_id] = ChatDownloadConfig()
 
@@ -690,7 +697,7 @@ class Application:
                 ]
 
     def _process_cloud_drive_config(self, _config: dict):
-        """处理云存储配置"""
+        """Process cloud drive config"""
         if "upload_drive" in _config:
             upload_drive_config = _config["upload_drive"]
             if upload_drive_config.get("enable_upload_file"):
@@ -720,7 +727,7 @@ class Application:
                 ]
 
     def _validate_date_format(self):
-        """验证日期格式"""
+        """Validate date format"""
         try:
             date = datetime(2023, 10, 31)
             date.strftime(self.date_format)
@@ -729,7 +736,7 @@ class Application:
             self.date_format = "%Y_%m"
 
     def _process_chat_filters(self):
-        """处理聊天过滤器"""
+        """Process chat filters"""
         for key, value in self.chat_download_config.items():
             self.chat_download_config[key].download_filter = replace_date_time(
                 value.download_filter
@@ -919,9 +926,9 @@ class Application:
     # pylint: disable = R0912
     def update_config(self, immediate: bool = True):
         try:
-            logger.info("开始更新配置...")
+            logger.info("Start updating config")
 
-            # 读取当前配置作为基础
+            # Read current config as base
             current_config = {}
             yaml_loader = YAML(typ='safe')
             yaml_loader.allow_duplicate_keys = True
@@ -934,7 +941,7 @@ class Application:
             else:
                 logger.debug("配置文件不存在，将创建新配置")
 
-            # 构建新的聊天配置列表
+            # Build new chat config list
             new_chat_list = []
             for chat_id, chat_conf in self.chat_download_config.items():
                 new_chat_list.append({
@@ -946,7 +953,7 @@ class Application:
             if hasattr(self, 'language'):
                 current_config['language'] = self.language.name
 
-            # 清理旧版字段
+            # Remove legacy fields
             old_keys = ["ids_to_retry", "chat_id", "download_filter"]
             for key in old_keys:
                 if key in current_config:
@@ -956,7 +963,7 @@ class Application:
                 logger.info(f"跳过写入配置，更新了 {len(new_chat_list)} 个聊天")
                 return len(new_chat_list) > 0
 
-            # 备份原配置到持久化目录
+            # Backup config to persistent directory
             backup_dir = self.session_file_path
             os.makedirs(backup_dir, exist_ok=True)
             base_name = os.path.basename(self.config_file)
@@ -971,7 +978,7 @@ class Application:
             except Exception as e:
                 logger.error(f"备份配置文件失败: {e}，将尝试继续写入")
 
-            # 直接写入原文件（覆盖）
+            # Write directly to original file (overwrite)
             try:
                 yaml_writer = YAML()
                 yaml_writer.allow_unicode = True
@@ -980,14 +987,14 @@ class Application:
                     yaml_writer.dump(current_config, f)
                 logger.success(f"✅ 配置更新成功，更新了 {len(new_chat_list)} 个聊天")
 
-                # 同步内存中的配置
+                # Sync in-memory config
                 self.config = current_config
 
                 self._clean_old_backups(backup_dir, base_name, keep=3)
                 return True
             except Exception as e:
                 logger.exception(f"写入配置文件失败: {e}")
-                # 尝试恢复备份
+                # Attempt restore from backup
                 if os.path.exists(backup_path):
                     try:
                         shutil.copy2(backup_path, self.config_file)
@@ -1001,7 +1008,7 @@ class Application:
             return False
 
     def _clean_old_backups(self, backup_dir, base_name, keep=3):
-        """清理指定目录中的旧备份文件"""
+        """Clean up old backup files"""
         import os
         import glob
         pattern = os.path.join(backup_dir, f"{base_name}.backup.*")
@@ -1029,7 +1036,7 @@ class Application:
 
         config_path = self.config_file
 
-        # 如果配置文件不存在，尝试从备份恢复
+        # If config file not found, try backup recovery
         if not os.path.exists(config_path):
             backups = glob.glob(f"{config_path}.backup.*")
             if backups:
@@ -1045,7 +1052,7 @@ class Application:
                 logger.error("配置文件不存在且无可用备份")
                 return False
 
-        # 加载配置文件
+        # Load config file
         try:
             yaml_loader = YAML(typ='safe')
             yaml_loader.allow_duplicate_keys = True
@@ -1058,7 +1065,7 @@ class Application:
             return True
         except Exception as e:
             logger.exception(f"加载配置文件失败: {e}")
-            # 尝试从备份恢复
+            # Try restore from backup
             backups = glob.glob(f"{config_path}.backup.*")
             if backups:
                 latest_backup = max(backups, key=os.path.getmtime)
@@ -1171,13 +1178,13 @@ class Application:
         )
 
     def _process_notifications_config(self, _config: dict):
-        """处理通知配置，支持旧版和新版配置"""
-        # 先检查是否有旧版的 bark_notification 配置
+        """Process notification config (legacy & new format)"""
+        # Check for legacy bark_notification config
         if "bark_notification" in _config:
             bark_config = _config["bark_notification"]
             logger.info("检测到旧版 Bark 配置，正在转换为新版格式...")
 
-            # 构建新的 notifications 配置
+            # Build new notifications config
             new_notifications = {
                 "bark": {
                     "enabled": bark_config.get("enabled", False),
@@ -1207,35 +1214,35 @@ class Application:
                 }
             }
 
-            # 将新配置合并到现有配置
+            # Merge into existing config
             if "notifications" not in _config:
                 _config["notifications"] = new_notifications
             else:
-                # 合并配置，新版配置优先
+                # New config takes priority when merging
                 existing = _config["notifications"]
                 if "bark" not in existing:
                     existing["bark"] = new_notifications["bark"]
                 else:
-                    # 合并 Bark 配置，新版优先
+                    # Merge Bark config; new version takes priority
                     for key, value in new_notifications["bark"].items():
                         if key not in existing["bark"]:
                             existing["bark"][key] = value
 
-                # 确保其他配置也存在
+                # Ensure other sub-configs exist
                 if "synology_chat" not in existing:
                     existing["synology_chat"] = new_notifications["synology_chat"]
                 if "global" not in existing:
                     existing["global"] = new_notifications["global"]
 
-            # 从配置中移除旧版配置
+            # Remove legacy config key
             _config.pop("bark_notification")
             logger.info("已将旧版 Bark 配置转换为新版 notifications 格式")
 
-        # 处理新版 notifications 配置
+        # Process new-format notifications config
         if "notifications" in _config:
             notifications_config = _config["notifications"]
 
-            # 确保所有必需的子配置都存在
+            # Ensure all required sub-configs exist
             if "bark" not in notifications_config:
                 notifications_config["bark"] = {
                     "enabled": False,
@@ -1262,16 +1269,16 @@ class Application:
                     "default_timeout": 15
                 }
 
-            # 设置到实例属性
+            # Set on instance attributes
             self.notifications = notifications_config
 
-            # 为了向后兼容，也设置 bark_notification 属性
+            # Set bark_notification for backward compatibility
             self.bark_notification = notifications_config.get("bark", {})
 
             logger.debug(f"已加载通知配置: Bark={notifications_config['bark'].get('enabled', False)}, "
                          f"SynologyChat={notifications_config['synology_chat'].get('enabled', False)}")
         else:
-            # 如果没有 notifications 配置，使用默认值
+            # Use defaults if no notifications config present
             self.notifications = ConfigSchema.get_default("notifications")
             self.bark_notification = self.notifications.get("bark", {})
             logger.debug("使用默认通知配置")

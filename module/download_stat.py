@@ -21,7 +21,7 @@ _total_download_size: int = 0
 _last_download_time: float = time.time()
 _download_state: DownloadState = DownloadState.Downloading
 
-# 添加异步锁保护共享字典
+# Async lock for shared dict protection
 _lock = asyncio.Lock()
 
 
@@ -31,8 +31,8 @@ def get_download_result() -> dict:
 
 
 def get_total_download_speed() -> int:
-    """get total download speed"""
-    if time.time() - _last_download_time > 2:  # 2秒无更新视为无下载
+    """Get total download speed (returns 0 if stale >2s)"""
+    if time.time() - _last_download_time > 2:  # Reset speed after 2s of no update
         return 0
     return _total_download_speed
 
@@ -50,7 +50,7 @@ def set_download_state(state: DownloadState):
 
 
 async def remove_download_record(chat_id, message_id):
-    """从下载结果字典中移除指定任务（异步安全）"""
+    """Remove a task from download result dict (async-safe)"""
     async with _lock:
         if chat_id in _download_result:
             if message_id in _download_result[chat_id]:
@@ -128,7 +128,7 @@ async def update_download_status(
             }
             _total_download_size += down_byte
 
-    # 速度统计部分不需要锁保护（只读/写全局变量，且更新频率低，用普通变量即可）
+    # Speed stats need no lock (low-frequency reads/writes on simple globals)
     if cur_time - _last_download_time >= 1.0:
         _total_download_speed = int(
             _total_download_size / (cur_time - _last_download_time)

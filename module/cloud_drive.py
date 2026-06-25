@@ -1,4 +1,7 @@
-"""provide upload cloud drive"""
+"""Cloud drive upload support
+
+Supports Rclone and Aligo adapters for uploading downloaded media to cloud storage.
+"""
 import asyncio
 import functools
 import importlib
@@ -49,14 +52,14 @@ class CloudDrive:
 
     @staticmethod
     def init_upload_adapter(drive_config: CloudDriveConfig):
-        """Initialize the upload adapter."""
+        """Initialize the upload adapter"""
         if drive_config.upload_adapter == "aligo":
             Aligo = importlib.import_module("aligo").Aligo
             drive_config.aligo = Aligo()
 
     @staticmethod
     def rclone_mkdir(drive_config: CloudDriveConfig, remote_dir: str):
-        """mkdir in remote"""
+        """Create directory in remote storage"""
         with Popen(
             f'"{drive_config.rclone_path}" mkdir "{remote_dir}/"',
             shell=True,
@@ -67,7 +70,7 @@ class CloudDrive:
 
     @staticmethod
     def aligo_mkdir(drive_config: CloudDriveConfig, remote_dir: str):
-        """mkdir in remote by aligo"""
+        """Create directory in remote storage via Aligo"""
         if drive_config.aligo and not drive_config.aligo.get_folder_by_path(remote_dir):
             drive_config.aligo.create_folder(name=remote_dir, check_name_mode="refuse")
 
@@ -95,18 +98,18 @@ class CloudDrive:
     ) -> bool:
         """Use Rclone upload file (copy or move)"""
         try:
-            # 构建远程目录
+            # Build remote directory path
             rel_path = os.path.dirname(local_file_path).replace(save_path, "").lstrip("/\\")
             remote_dir = drive_config.remote_dir.rstrip("/") + "/" + rel_path + "/"
             remote_dir = remote_dir.replace("\\", "/").replace("//", "/")
             logger.info(f"准备上传到远程目录: {remote_dir}")
 
-            # 确保远程目录存在
+            # Ensure remote directory exists
             if not drive_config.dir_cache.get(remote_dir):
                 CloudDrive.rclone_mkdir(drive_config, remote_dir)
                 drive_config.dir_cache[remote_dir] = True
 
-            # 处理压缩
+            # Handle compression
             zip_file_path = ""
             file_to_upload = local_file_path
             if drive_config.before_upload_file_zip:
@@ -114,7 +117,7 @@ class CloudDrive:
                 file_to_upload = zip_file_path
                 logger.debug(f"已压缩文件: {zip_file_path}")
 
-            # 选择命令
+            # Choose rclone action
             rclone_action = "move" if drive_config.after_upload_file_delete else "copy"
             cmd = (
                 f'"{drive_config.rclone_path}" {rclone_action} "{file_to_upload}" '
@@ -138,11 +141,11 @@ class CloudDrive:
                     line = line_bytes.decode(errors="replace").rstrip()
                     logger.debug(f"rclone stdout: {line}")
 
-                    # 检测成功标志：出现 100% 即认为成功
+                    # 100% progress detected -> success
                     if "100%" in line:
                         success = True
 
-                    # 解析进度信息
+                    # Parse progress info
                     pattern = r"Transferred: (.*?) / (.*?), (.*?)%, (.*?/s)?, ETA (.*?)$"
                     match = re.search(pattern, line)
                     if match:
@@ -151,7 +154,7 @@ class CloudDrive:
                             speed = "0 B/s"
                         logger.debug(f"进度: {percent}%, 速度: {speed}, 剩余: {eta}")
 
-                        # 调用回调（如果提供），传递全部8个参数
+                        # Call progress callback with full args
                         if progress_callback and progress_args:
                             if len(progress_args) >= 3:
                                 node, msg_id, fname = progress_args[0], progress_args[1], progress_args[2]
@@ -166,14 +169,14 @@ class CloudDrive:
                             else:
                                 logger.warning(f"progress_args 长度不足: {len(progress_args)}, 期望至少3个")
 
-            # 等待进程结束
+            # Wait for process to finish
             returncode = await proc.wait()
             stderr = (await proc.stderr.read()).decode(errors="replace") if proc.stderr else ""
             if returncode != 0:
                 logger.error(f"rclone 进程退出码: {returncode}, stderr: {stderr}")
                 return False
 
-            # 如果未检测到成功标志，但进程正常结束，尝试判断是否成功
+            # No 100% detected but exit clean; infer success
             if not success:
                 if rclone_action == "move" and not os.path.exists(file_to_upload):
                     logger.info("使用 move 且源文件已不存在，认为上传成功")
@@ -185,12 +188,12 @@ class CloudDrive:
                     logger.error("上传失败，未检测到成功标志且进程非正常结束")
                     return False
 
-            # 处理成功后清理
+            # Post-success cleanup
             if success:
                 drive_config.total_upload_success_file_count += 1
                 logger.info(f"上传成功: {local_file_path} -> {remote_dir}")
 
-                # 如果使用 move，rclone 应该已删除源文件，但为了保险，检查并尝试删除
+                # If using move, rclone should have deleted source; verify
                 if rclone_action == "move":
                     if os.path.exists(file_to_upload):
                         logger.warning(f"move 后本地文件仍存在，尝试手动删除: {file_to_upload}")
@@ -206,7 +209,7 @@ class CloudDrive:
                     except Exception as e:
                         logger.warning(f"删除本地文件失败: {e}")
 
-                # 删除压缩文件
+                # Remove zip file
                 if drive_config.before_upload_file_zip and zip_file_path and os.path.exists(zip_file_path):
                     try:
                         os.remove(zip_file_path)
